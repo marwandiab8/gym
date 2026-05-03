@@ -1146,10 +1146,25 @@ async function startWorkoutFromTemplate(templateId, template) {
           date: els.dateInput?.value || todayISO(),
           unit: els.unitSelect?.value || "lb",
         });
-        workoutState.exercises = newExercises; workoutState.templateId = templateId; workoutState.routineName = template.name; workoutState.focus = []; workoutState.notes = ""; if (els.workoutNotesInput) els.workoutNotesInput.value = ""; syncFocusUI();
-        for (let ex of workoutState.exercises) ex.lastSets = await fetchLastFinalSetsForExerciseSafe(ex.exerciseId);
+        workoutState.exercises = newExercises;
+        workoutState.templateId = templateId;
+        workoutState.routineName = template.name;
+        workoutState.focus = [];
+        workoutState.notes = "";
+        if (els.workoutNotesInput) els.workoutNotesInput.value = "";
+        syncFocusUI();
+        setActiveBadge();
+        setAuthUI();
+        renderWorkoutBuilder();
+        await Promise.all(
+          workoutState.exercises.map(async (ex) => {
+            ex.lastSets = await fetchLastFinalSetsForExerciseSafe(ex.exerciseId);
+          })
+        );
+        renderWorkoutBuilder();
         await saveWorkoutDraft();
-        setActiveBadge(); setAuthUI(); renderWorkoutBuilder(); await updateResumeDraftButtonState(); setStatus("Routine started ✓");
+        await updateResumeDraftButtonState();
+        setStatus("Routine started ✓");
     } catch (e) { setStatus("Failed to start routine.", "error"); } finally { if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = false; }
 }
 
