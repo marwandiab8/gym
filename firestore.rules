@@ -1,0 +1,183 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isNonEmptyString(value, maxLen) {
+      return value is string && value.size() > 0 && value.size() <= maxLen;
+    }
+
+    function isOptionalString(value, maxLen) {
+      return value == null || (value is string && value.size() <= maxLen);
+    }
+
+    function isStringList(value, maxItems) {
+      return value is list && value.size() <= maxItems;
+    }
+
+    function isWeight(value) {
+      return value is int || value is float;
+    }
+
+    function validUnit(unit) {
+      return unit == "lb" || unit == "kg";
+    }
+
+    function validUserDocCreate(data) {
+      return data.keys().hasOnly(["lastSeen", "favoriteExerciseIds"]) &&
+        (!data.keys().hasAny(["favoriteExerciseIds"]) || isStringList(data.favoriteExerciseIds, 200));
+    }
+
+    function validUserDocUpdate() {
+      let changedKeys = request.resource.data.diff(resource.data).affectedKeys();
+      return changedKeys.hasOnly(["lastSeen", "favoriteExerciseIds"]) &&
+        (!changedKeys.hasAny(["favoriteExerciseIds"]) || isStringList(request.resource.data.favoriteExerciseIds, 200));
+    }
+
+    function validWorkoutSet(s) {
+      return s is map &&
+        s.keys().hasOnly(["weight", "reps", "rpe"]) &&
+        (!s.keys().hasAny(["weight"]) || s.weight is string || s.weight is int || s.weight is float) &&
+        (!s.keys().hasAny(["reps"]) || s.reps is string || s.reps is int || s.reps is float) &&
+        (!s.keys().hasAny(["rpe"]) || s.rpe is string || s.rpe is int || s.rpe is float);
+    }
+
+    function validSetList(sets, i) {
+      return sets is list && sets.size() <= 35 &&
+        (i >= sets.size() ? true : (validWorkoutSet(sets[i]) && validSetList(sets, i + 1)));
+    }
+
+    function validWorkoutExercise(ex) {
+      return ex is map &&
+        ex.keys().size() <= 16 &&
+        ex.exerciseId is string && ex.exerciseId.size() > 0 && ex.exerciseId.size() <= 120 &&
+        ex.name is string && ex.name.size() > 0 && ex.name.size() <= 240 &&
+        ex.sets is list && validSetList(ex.sets, 0) &&
+        (!ex.keys().hasAny(["lastSets"]) || (ex.lastSets is list && validSetList(ex.lastSets, 0))) &&
+        (!ex.keys().hasAny(["exerciseNote"]) || (ex.exerciseNote is string && ex.exerciseNote.size() <= 4000)) &&
+        (!ex.keys().hasAny(["addedAt"]) || ex.addedAt is int || ex.addedAt is float) &&
+        (!ex.keys().hasAny(["firstEditTime"]) || ex.firstEditTime == null || ex.firstEditTime is int || ex.firstEditTime is float) &&
+        (!ex.keys().hasAny(["lastEditTime"]) || ex.lastEditTime == null || ex.lastEditTime is int || ex.lastEditTime is float);
+    }
+
+    function validExerciseList(list, i) {
+      return list is list && list.size() <= 50 &&
+        (i >= list.size() ? true : (validWorkoutExercise(list[i]) && validExerciseList(list, i + 1)));
+    }
+
+    function validWorkout(data) {
+      return data.keys().hasOnly([
+        "status",
+        "date",
+        "unit",
+        "exercises",
+        "startedAt",
+        "updatedAtMs",
+        "routineName",
+        "focus",
+        "templateId",
+        "notes",
+        "finishedAt"
+      ]) &&
+      (data.status == "draft" || data.status == "final") &&
+      isNonEmptyString(data.date, 20) &&
+      validUnit(data.unit) &&
+      data.exercises is list &&
+      data.exercises.size() <= 50 &&
+      data.updatedAtMs is int &&
+      isNonEmptyString(data.routineName, 80) &&
+      isStringList(data.focus, 8) &&
+      isOptionalString(data.templateId, 120) &&
+      isOptionalString(data.notes, 2000) &&
+      validExerciseList(data.exercises, 0);
+    }
+
+    function validPr(data) {
+      return data.keys().hasOnly([
+        "exerciseId",
+        "exerciseName",
+        "weight",
+        "reps",
+        "unit",
+        "date",
+        "timestamp"
+      ]) &&
+      isNonEmptyString(data.exerciseId, 120) &&
+      isNonEmptyString(data.exerciseName, 120) &&
+      isWeight(data.weight) &&
+      data.reps is int &&
+      validUnit(data.unit) &&
+      isNonEmptyString(data.date, 20);
+    }
+
+    function validTemplate(data) {
+      return data.keys().hasOnly(["name", "exercises", "createdAt"]) &&
+        isNonEmptyString(data.name, 80) &&
+        data.exercises is list &&
+        data.exercises.size() <= 25;
+    }
+
+    function validCustomExercise(data) {
+      return data.keys().hasOnly(["name", "nameLower", "createdAt"]) &&
+        isNonEmptyString(data.name, 120) &&
+        isNonEmptyString(data.nameLower, 120);
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && validUserDocCreate(request.resource.data);
+      allow update: if isOwner(userId) && validUserDocUpdate();
+      allow delete: if false;
+
+      match /workouts/{workoutId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validWorkout(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /prs/{prId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validPr(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /templates/{templateId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validTemplate(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /custom_exercises/{exerciseId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validCustomExercise(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /workout_summaries/{summaryId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+
+      match /exercise_last_sets/{exerciseId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+
+    match /catalog_exercises/{document=**} {
+      allow read: if isSignedIn();
+    }
+    match /catalog_equipment/{document=**} {
+      allow read: if isSignedIn();
+    }
+    match /catalog_muscles/{document=**} {
+      allow read: if isSignedIn();
+    }
+  }
+}

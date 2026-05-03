@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Progress — K2 Tracker</title>
+  <meta name="theme-color" content="#09090b" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="K2 Tracker" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {} }
+    };
+  </script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen selection:bg-emerald-500 selection:text-white pb-24">
+
+  <header class="sticky top-0 z-40 border-b border-zinc-800 bg-zinc-950/85 backdrop-blur-md">
+  <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8">
+
+    <a href="index.html" class="flex min-w-0 items-center gap-3">
+      <img
+        src="/k2_logo.png"
+        alt="K2 Logo"
+        class="h-11 w-11 rounded-xl object-contain bg-white/5 p-1 shadow-sm ring-1 ring-white/10"
+      />
+      <div class="min-w-0 leading-tight">
+        <div class="truncate text-lg font-black tracking-tight text-white sm:text-xl">
+          K2 Gym Tracker
+        </div>
+        <div class="truncate text-xs font-medium uppercase tracking-[0.18em] text-zinc-400">
+          PR Tracking • Progress • Consistency
+        </div>
+      </div>
+    </a>
+
+    <span
+      id="activeWorkoutBadge"
+      class="hidden max-w-[140px] truncate rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-emerald-400 sm:max-w-[200px]"
+      aria-live="polite"
+    ></span>
+
+    <nav class="hidden items-center gap-2 md:flex">
+      <a href="index.html#analyticsContent" class="rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white">
+        Analytics
+      </a>
+      <a href="index.html#recentWorkouts" class="rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white">
+        Workouts
+      </a>
+      <a href="progress.html" class="rounded-lg px-3 py-2 text-sm font-medium text-white bg-white/10 transition hover:bg-white/15">
+        Progress
+      </a>
+      <a href="prs.html" class="rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white">
+        PRs
+      </a>
+    </nav>
+
+    <div class="flex items-center gap-2">
+      <span id="userLabel" class="text-sm font-medium text-emerald-400 hidden md:block mr-2 truncate max-w-[150px]"></span>
+      <div id="saveStatus" class="text-xs font-medium text-zinc-400 max-w-[140px] truncate text-right hidden sm:block"></div>
+      <button
+        id="loginBtn"
+        class="rounded-xl px-4 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white"
+      >
+        Log In
+      </button>
+
+      <button
+        id="logoutBtn"
+        class="rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-semibold text-white transition hover:border-zinc-500 hover:bg-zinc-800 hidden"
+      >
+        Log Out
+      </button>
+
+      <button
+        type="button"
+        id="mobileMenuBtn"
+        class="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-700 bg-zinc-900 text-zinc-300 transition hover:border-zinc-500 hover:bg-zinc-800 hover:text-white md:hidden"
+        aria-label="Open menu"
+        aria-expanded="false"
+        aria-controls="mobileNavPanel"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 6h16M4 12h16M4 18h16" />
+        </svg>
+      </button>
+    </div>
+
+  </div>
+</header>
+
+  <div
+    id="mobileNavPanel"
+    class="hidden fixed inset-x-0 top-[57px] z-50 border-b border-zinc-800 bg-zinc-950/95 p-4 shadow-xl backdrop-blur-md md:hidden"
+    role="dialog"
+    aria-label="Mobile navigation"
+  >
+    <nav class="flex flex-col gap-1">
+      <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="index.html#analyticsContent">Analytics</a>
+      <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="index.html#recentWorkouts">Workouts</a>
+      <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="progress.html">Progress</a>
+      <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="prs.html">PRs</a>
+    </nav>
+  </div>
+
+  <main class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
+    <div class="lg:col-span-12">
+      <div class="bg-[#111] border border-zinc-800 rounded-3xl p-6 md:p-8">
+        <h2 class="text-2xl font-bold mb-6 flex items-center gap-3"><i class="fa-solid fa-arrow-trend-up text-blue-500"></i> Progress Charts</h2>
+        <div class="flex flex-wrap md:flex-nowrap gap-3 mb-6">
+          <select id="chartExerciseSelect" class="flex-1 bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 appearance-none"></select>
+        </div>
+        <div class="w-full h-[300px] relative overflow-hidden rounded-xl border border-zinc-800/60 bg-zinc-950/40">
+          <canvas id="progressChart" class="h-full w-full"></canvas>
+          <div
+            id="progressChartEmpty"
+            class="hidden absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-zinc-500 leading-relaxed"
+            role="status"
+          ></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div id="restTimerWidget" class="hidden fixed bottom-6 right-6 bg-zinc-900 border border-zinc-700 rounded-2xl p-4 shadow-[0_10px_40px_rgba(0,0,0,0.5)] z-50 flex items-center gap-5">
+    <div class="text-emerald-400 font-mono text-3xl font-black tracking-widest" id="timerDisplay">02:00</div>
+    <div class="flex gap-2">
+      <button id="timerAddBtn" class="bg-zinc-800 hover:bg-zinc-700 px-3 py-2 rounded-lg text-sm text-zinc-300 font-bold transition-colors">+15s</button>
+      <button id="timerPlayPauseBtn" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-white font-bold transition-colors"><i class="fa-solid fa-play"></i></button>
+      <button id="timerStopBtn" class="bg-zinc-800 hover:bg-zinc-700 px-3 py-2 rounded-lg text-zinc-300 font-bold transition-colors" title="Stop and reset"><i class="fa-solid fa-stop"></i></button>
+      <button id="timerCloseBtn" class="text-zinc-500 hover:text-zinc-300 px-3 py-2 transition-colors" title="Hide timer"><i class="fa-solid fa-xmark text-lg"></i></button>
+    </div>
+  </div>
+
+  <dialog id="draftRecoveryDialog" class="bg-[#111] border border-zinc-700 rounded-3xl p-6 max-w-md w-[calc(100%-2rem)] text-zinc-100 shadow-2xl backdrop:bg-black/80 m-auto">
+    <h3 class="text-lg font-bold text-emerald-400 mb-2">Unfinished workout</h3>
+    <p id="draftRecoveryText" class="text-sm text-zinc-400 mb-6 leading-relaxed"></p>
+    <div class="flex flex-col sm:flex-row gap-3">
+      <button type="button" id="draftRecoveryResume" class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl">Resume workout</button>
+      <button type="button" id="draftRecoveryDiscard" class="flex-1 border border-zinc-600 hover:bg-zinc-800 text-zinc-200 font-bold py-3 rounded-xl">Discard draft</button>
+    </div>
+  </dialog>
+
+  <dialog id="workoutModal" class="bg-[#111] border border-zinc-700 rounded-3xl p-6 md:p-8 text-zinc-100 max-w-2xl w-full backdrop:bg-black/80 shadow-2xl m-auto">
+    <div class="flex justify-between items-center mb-6 border-b border-zinc-800 pb-4">
+      <h2 id="modalTitle" class="text-2xl font-bold text-emerald-400">Workout Details</h2>
+      <div class="flex gap-4">
+        <button id="deleteWorkoutBtn" class="text-red-500 hover:text-red-400 font-medium text-sm transition-colors"><i class="fa-solid fa-trash mr-1"></i> Delete Workout</button>
+        <button id="closeModalBtn" class="text-zinc-500 hover:text-white transition-colors"><i class="fa-solid fa-xmark text-2xl"></i></button>
+      </div>
+    </div>
+    <div id="modalContent" class="space-y-6 max-h-[60vh] overflow-y-auto custom-scrollbar pr-2"></div>
+  </dialog>
+
+  <dialog id="templateModal" class="bg-[#111] border border-zinc-700 rounded-3xl p-6 md:p-8 text-zinc-100 max-w-lg w-full backdrop:bg-black/80 shadow-2xl m-auto">
+    <div class="flex justify-between items-center mb-6 border-b border-zinc-800 pb-4">
+      <h2 class="text-2xl font-bold text-indigo-400">Edit Routine</h2>
+      <button id="closeTemplateModalBtn" class="text-zinc-500 hover:text-white transition-colors"><i class="fa-solid fa-xmark text-2xl"></i></button>
+    </div>
+    <div class="space-y-5">
+      <div>
+        <label class="block text-xs font-bold text-zinc-500 mb-2 uppercase">Routine Name</label>
+        <input id="editTemplateName" type="text" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500" />
+      </div>
+      <div>
+          <label class="block text-xs font-bold text-zinc-500 mb-2 uppercase flex justify-between">
+              <span>Exercises</span>
+              <span class="text-zinc-600 font-normal normal-case">(To add more, start the routine)</span>
+          </label>
+          <div id="editTemplateExercises" class="space-y-2 max-h-[30vh] overflow-y-auto custom-scrollbar pr-2"></div>
+      </div>
+      <div class="pt-4 flex gap-3 border-t border-zinc-800">
+        <button id="saveTemplateChangesBtn" class="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl transition-colors">Save Changes</button>
+        <button id="deleteTemplateModalBtn" class="border border-red-500/50 hover:bg-red-500/10 text-red-500 font-bold px-4 rounded-xl transition-colors" title="Delete Routine"><i class="fa-solid fa-trash"></i></button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="aiModal" class="bg-[#111] border border-indigo-500/30 rounded-3xl p-6 md:p-8 text-zinc-100 max-w-lg w-full backdrop:bg-black/80 shadow-[0_0_50px_rgba(79,70,229,0.15)] m-auto">
+    <div class="flex justify-between items-center mb-6 border-b border-zinc-800 pb-4">
+      <h2 class="text-2xl font-bold flex items-center gap-2"><i class="fa-solid fa-wand-magic-sparkles text-indigo-400"></i> AI Generator</h2>
+      <button id="closeAiModalBtn" class="text-zinc-500 hover:text-white transition-colors"><i class="fa-solid fa-xmark text-2xl"></i></button>
+    </div>
+    <div class="space-y-5">
+      <div id="aiErrorBanner" class="hidden rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200" role="alert"></div>
+      <div>
+        <label class="block text-xs font-bold text-zinc-500 mb-2 uppercase">What do you want to train?</label>
+        <textarea id="aiPromptInput" rows="3" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500 placeholder-zinc-600 resize-none" placeholder="e.g., Build me a 4-exercise chest routine focusing on strength."></textarea>
+      </div>
+      <div class="text-xs text-zinc-500">
+        The AI will generate the workout and try to match the exercises to your database. Any new exercises will be saved automatically.
+      </div>
+      <button id="generateAiBtn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl transition-colors text-lg shadow-lg shadow-indigo-900/20">Generate Routine</button>
+    </div>
+  </dialog>
+
+  <script type="module" src="app.js?v=20260421-3m"></script>
+</body>
+</html>

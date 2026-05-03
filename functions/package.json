@@ -1,0 +1,20 @@
+{
+  "name": "functions",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "lint": "node --check index.js",
+    "smoke": "node --check index.js",
+    "test": "node --test test/setScoring.test.js test/aiRoutine.test.js",
+    "serve": "cd .. && firebase emulators:start --only functions,firestore,hosting",
+    "shell": "cd .. && firebase functions:shell",
+    "predeploy:check": "npm run lint && npm run smoke && npm test"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.5.0",
+    "firebase-functions": "^5.0.1"
+  }
+}

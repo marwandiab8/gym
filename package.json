@@ -1,0 +1,12 @@
+{
+  "name": "gym-k2",
+  "private": true,
+  "scripts": {
+    "lint": "npm run lint --prefix functions",
+    "test": "npm test --prefix functions",
+    "emulators": "firebase emulators:start",
+    "deploy": "firebase deploy",
+    "predeploy:check": "npm run lint",
+    "secret:openai": "./scripts/set-openai-secret.sh"
+  }
+}
