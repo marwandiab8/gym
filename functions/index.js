@@ -1,7 +1,5 @@
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
-const { defineSecret } = require("firebase-functions/params");
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { buildExerciseSummaries } = require("./lib/setScoring");
 const {
   normalizePrompt,
@@ -12,11 +10,9 @@ const {
 
 admin.initializeApp();
 
-// Secret setup:
-//   export OPENAI_API_KEY="sk-..."
-//   ./scripts/set-openai-secret.sh
-// The key must exist in Firebase Secret Manager as OPENAI_API_KEY.
-const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
+// Gen1 callable + Secret Manager (same name as before). Do not use v2 onCall here:
+// Firebase cannot upgrade an existing Gen1 function to Gen2 in place.
+// Secret: ./scripts/set-openai-secret.sh → OPENAI_API_KEY, read as process.env.OPENAI_API_KEY.
 
 const AI_MODEL = "gpt-4.1-mini";
 const AI_REGION = "us-central1";
@@ -39,13 +35,13 @@ async function enforceAiRateLimit(uid) {
 
     if ((Number(state.lastRequestAtMs) || 0) + AI_COOLDOWN_MS > now) {
       const retryAfterSec = Math.ceil((((Number(state.lastRequestAtMs) || 0) + AI_COOLDOWN_MS) - now) / 1000);
-      throw new HttpsError("resource-exhausted", `Please wait ${retryAfterSec}s before generating another routine.`);
+      throw new functions.https.HttpsError("resource-exhausted", `Please wait ${retryAfterSec}s before generating another routine.`);
     }
 
     const withinWindow = (Number(state.windowStartedAtMs) || 0) + AI_RATE_WINDOW_MS > now;
     const requestCount = withinWindow ? Number(state.requestCount || 0) : 0;
     if (requestCount >= AI_MAX_REQUESTS_PER_WINDOW) {
-      throw new HttpsError("resource-exhausted", "Hourly AI generation limit reached. Please try again later.");
+      throw new functions.https.HttpsError("resource-exhausted", "Hourly AI generation limit reached. Please try again later.");
     }
 
     tx.set(rateRef, {
@@ -160,25 +156,25 @@ exports.onWorkoutFinalize = functions.firestore
     return null;
   });
 
-exports.generateAiRoutine = onCall(
-  {
-    region: AI_REGION,
+exports.generateAiRoutine = functions
+  .runWith({
+    secrets: ["OPENAI_API_KEY"],
     timeoutSeconds: 60,
-    memory: "256MiB",
-    secrets: [OPENAI_API_KEY],
-  },
-  async (request) => {
-    const uid = request.auth?.uid;
+    memory: "256MB",
+  })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
     if (!uid) {
-      throw new HttpsError("unauthenticated", "You must be signed in.");
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
     }
 
-    if (!isStructuredObject(request.data) || !Object.keys(request.data).every((key) => key === "prompt")) {
+    if (!isStructuredObject(data) || !Object.keys(data).every((key) => key === "prompt")) {
       console.warn("AI request rejected: invalid shape", { uid });
       return { ok: false, exercises: [], error: "Invalid request payload." };
     }
 
-    const prompt = normalizePrompt(request.data.prompt);
+    const prompt = normalizePrompt(data.prompt);
     if (prompt.length < AI_PROMPT_MIN_LENGTH) {
       return { ok: false, exercises: [], error: "Describe the workout you want in a bit more detail." };
     }
@@ -186,10 +182,10 @@ exports.generateAiRoutine = onCall(
       return { ok: false, exercises: [], error: `Prompt is too long. Keep it under ${AI_PROMPT_MAX_LENGTH} characters.` };
     }
 
-    const apiKey = OPENAI_API_KEY.value();
+    const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       console.error("AI request rejected: missing OPENAI_API_KEY secret", { uid });
-      throw new HttpsError("failed-precondition", "OPENAI_API_KEY secret is not configured.");
+      throw new functions.https.HttpsError("failed-precondition", "OPENAI_API_KEY secret is not configured.");
     }
 
     await enforceAiRateLimit(uid);
@@ -197,7 +193,6 @@ exports.generateAiRoutine = onCall(
     console.log("AI routine generation requested", {
       uid,
       promptLength: prompt.length,
-      hasAppCheck: Boolean(request.app),
     });
 
     try {
@@ -252,7 +247,7 @@ exports.generateAiRoutine = onCall(
         },
       };
     } catch (error) {
-      if (error instanceof HttpsError) throw error;
+      if (error instanceof functions.https.HttpsError) throw error;
       console.error("AI generation failed", {
         uid,
         message: error?.message || String(error),
@@ -263,5 +258,4 @@ exports.generateAiRoutine = onCall(
         error: "Could not generate a routine right now. Please try again in a moment.",
       };
     }
-  }
-);
+  });

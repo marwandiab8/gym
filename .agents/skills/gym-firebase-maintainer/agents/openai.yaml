@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gym Firebase Maintainer"
+  short_description: "Maintain the GYM Firebase workout tracker safely"
+  default_prompt: "Use $gym-firebase-maintainer to review or modify this Firebase workout tracker without breaking derived workout data."

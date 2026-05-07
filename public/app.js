@@ -36,6 +36,7 @@ const els = {
   aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"),
   workoutNotesWrap: document.getElementById("workoutNotesWrap"), workoutNotesInput: document.getElementById("workoutNotesInput"),
   draftRecoveryDialog: document.getElementById("draftRecoveryDialog"), draftRecoveryText: document.getElementById("draftRecoveryText"), draftRecoveryResume: document.getElementById("draftRecoveryResume"), draftRecoveryDiscard: document.getElementById("draftRecoveryDiscard"),
+  editWorkoutNameBtn: document.getElementById("editWorkoutNameBtn"),
 };
 
 let currentUser = null; let activeWorkoutRef = null; let autosaveTimer = null; let saveIndicatorTimer = null; let draftRecoveryShownThisSession = false;
@@ -376,9 +377,11 @@ async function resumeLatestDraft() {
 
 async function offerDraftRecoveryIfNeeded() {
   if (!currentUser || activeWorkoutRef || draftRecoveryShownThisSession) return;
+  const uidAtStart = currentUser.uid;
   await updateResumeDraftButtonState();
   const cloudList = await fetchSortedDraftWorkouts();
   const localSnap = readLocalDraftSnapshot();
+  if (!currentUser || currentUser.uid !== uidAtStart || activeWorkoutRef || draftRecoveryShownThisSession) return;
   if (cloudList.length === 0 && !(localSnap && localSnap.workoutId)) return;
   draftRecoveryShownThisSession = true;
   const preview = cloudList[0];
@@ -390,6 +393,11 @@ async function offerDraftRecoveryIfNeeded() {
   if (localSnap && localSnap.workoutId) parts.push("A backup exists on this device (used if it is newer).");
   if (els.draftRecoveryText) els.draftRecoveryText.textContent = parts.join(" ");
   els.draftRecoveryDialog?.showModal();
+}
+
+function suppressDraftRecoveryForNewStart() {
+  draftRecoveryShownThisSession = true;
+  els.draftRecoveryDialog?.close();
 }
 
 // Focus + session fields trigger debounced save
@@ -1000,6 +1008,7 @@ function showAiError(msg) {
 els.openAiModalBtn?.addEventListener("click", () => {
   if (!currentUser) return alert("Please sign in to use the AI Generator.");
   if (activeWorkoutRef && !confirm("You have an active workout in progress. Overwrite it with a new AI routine?")) return;
+  suppressDraftRecoveryForNewStart();
   clearAiError();
   els.aiModal?.showModal();
 });
@@ -1135,6 +1144,7 @@ async function startWorkoutFromTemplate(templateId, template) {
     if (!currentUser) return;
     if (activeWorkoutRef && !confirm("You have an active workout. Discard it and start this routine?")) return;
     try {
+        suppressDraftRecoveryForNewStart();
         setStatus("Starting Routine...");
         if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = true;
         if (activeWorkoutRef) { await deleteDoc(activeWorkoutRef); clearLocalDraft(); }
@@ -1172,6 +1182,7 @@ async function startWorkoutFromTemplate(templateId, template) {
 els.startWorkoutBtn?.addEventListener("click", async () => {
   if (!currentUser || activeWorkoutRef) return;
   try {
+    suppressDraftRecoveryForNewStart();
     setStatus("Starting...");
     els.startWorkoutBtn.disabled = true;
     activeWorkoutRef = await createWorkoutDraftInFirestore({
@@ -1575,6 +1586,8 @@ async function loadAnalytics() {
 }
 
 let currentModalWorkoutId = null;
+let currentModalWorkout = null;
+let currentModalDisplayDate = "";
 async function openWorkoutDetailsFromSummary(summary, displayDate) {
   if (!currentUser || !summary?.id) return;
   try {
@@ -1591,6 +1604,8 @@ async function openWorkoutDetailsFromSummary(summary, displayDate) {
 }
 
 function showWorkoutDetailsModal(workout, displayDate) {
+    currentModalWorkout = workout;
+    currentModalDisplayDate = displayDate;
     currentModalWorkoutId = workout.id; els.modalTitle.textContent = `Workout Details`;
     let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span></div>`;
     (workout.exercises || []).forEach(ex => {
@@ -1604,6 +1619,35 @@ function showWorkoutDetailsModal(workout, displayDate) {
     });
     els.modalContent.innerHTML = contentHtml; els.workoutModal.showModal();
 }
+els.editWorkoutNameBtn?.addEventListener("click", async () => {
+    if (!currentModalWorkoutId || !currentUser) return;
+    const currentName = String(currentModalWorkout?.routineName || "Custom Workout");
+    const nextNameRaw = prompt("Edit routine name", currentName);
+    if (nextNameRaw == null) return;
+    const nextName = nextNameRaw.replace(/\s+/g, " ").trim();
+    if (!nextName) return setStatus("Routine name cannot be blank.", "error");
+    if (nextName.length > 80) return setStatus("Routine name must be 80 characters or less.", "error");
+    if (nextName === currentName) return;
+    try {
+        els.editWorkoutNameBtn.disabled = true;
+        els.editWorkoutNameBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> Saving...`;
+        await updateDoc(doc(db, "users", currentUser.uid, "workouts", currentModalWorkoutId), {
+          routineName: nextName,
+          updatedAtMs: Date.now(),
+        });
+        currentModalWorkout = { ...(currentModalWorkout || {}), id: currentModalWorkoutId, routineName: nextName };
+        showWorkoutDetailsModal(currentModalWorkout, currentModalDisplayDate);
+        resetWorkoutAnalyticsCaches();
+        await loadAnalytics();
+        setStatus("Routine name updated.", "info");
+    } catch (e) {
+        console.error("Failed to update routine name", e);
+        setStatus("Failed to update routine name.", "error");
+    } finally {
+        els.editWorkoutNameBtn.disabled = false;
+        els.editWorkoutNameBtn.innerHTML = `<i class="fa-solid fa-pen mr-1"></i> Edit Routine`;
+    }
+});
 els.deleteWorkoutBtn?.addEventListener("click", async () => {
     if (!currentModalWorkoutId || !currentUser) return;
     if (confirm("Permanently delete this workout? This will remove it from your analytics and charts.")) {
@@ -1611,7 +1655,7 @@ els.deleteWorkoutBtn?.addEventListener("click", async () => {
         catch (e) { alert("Failed to delete the workout."); } finally { els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-trash mr-1"></i> Delete Workout`; els.deleteWorkoutBtn.disabled = false; }
     }
 });
-els.closeModalBtn?.addEventListener("click", () => els.workoutModal.close());
+els.closeModalBtn?.addEventListener("click", () => { currentModalWorkout = null; currentModalWorkoutId = null; currentModalDisplayDate = ""; els.workoutModal.close(); });
 
 // ==================== REST TIMER ====================
 // Source of truth while running: wall-clock end time (timerEndAt). setInterval only refreshes the UI ~1s; iOS throttles timers in background, so we recompute remaining time from Date.now() on resume (visibility/pageshow/focus) and from each tick.
