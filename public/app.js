@@ -37,12 +37,14 @@ const els = {
   workoutNotesWrap: document.getElementById("workoutNotesWrap"), workoutNotesInput: document.getElementById("workoutNotesInput"),
   draftRecoveryDialog: document.getElementById("draftRecoveryDialog"), draftRecoveryText: document.getElementById("draftRecoveryText"), draftRecoveryResume: document.getElementById("draftRecoveryResume"), draftRecoveryDiscard: document.getElementById("draftRecoveryDiscard"),
   editWorkoutNameBtn: document.getElementById("editWorkoutNameBtn"),
+  editWorkoutFocusBtn: document.getElementById("editWorkoutFocusBtn"),
 };
 
 let currentUser = null; let activeWorkoutRef = null; let autosaveTimer = null; let saveIndicatorTimer = null; let draftRecoveryShownThisSession = false;
 const LOCAL_DRAFT_KEY_PREFIX = "k2_gym_workout_draft_v1:";
 const AUTOSAVE_DEBOUNCE_MS = 800;
 const AI_PROMPT_MAX_LENGTH = 600;
+const WORKOUT_FOCUS_OPTIONS = ["Legs", "Chest", "Shoulders", "Back"];
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
 
@@ -1607,7 +1609,8 @@ function showWorkoutDetailsModal(workout, displayDate) {
     currentModalWorkout = workout;
     currentModalDisplayDate = displayDate;
     currentModalWorkoutId = workout.id; els.modalTitle.textContent = `Workout Details`;
-    let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span></div>`;
+    const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
+    let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div>`;
     (workout.exercises || []).forEach(ex => {
         let timeHtml = ""; let tStart = ex.firstEditTime || ex.addedAt; let tEnd = ex.lastEditTime || ex.firstEditTime || ex.addedAt;
         if (tStart && tEnd && Math.abs(tEnd - tStart) > 60000) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)} - ${formatTimeDisplay(tEnd)}</span>`; } else if (tStart) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)}</span>`; }
@@ -1646,6 +1649,39 @@ els.editWorkoutNameBtn?.addEventListener("click", async () => {
     } finally {
         els.editWorkoutNameBtn.disabled = false;
         els.editWorkoutNameBtn.innerHTML = `<i class="fa-solid fa-pen mr-1"></i> Edit Routine`;
+    }
+});
+els.editWorkoutFocusBtn?.addEventListener("click", async () => {
+    if (!currentModalWorkoutId || !currentUser) return;
+    const currentFocus = Array.isArray(currentModalWorkout?.focus) ? currentModalWorkout.focus : [];
+    const nextFocusRaw = prompt(`Edit focus. Use comma-separated values from: ${WORKOUT_FOCUS_OPTIONS.join(", ")}`, currentFocus.join(", "));
+    if (nextFocusRaw == null) return;
+    const nextFocus = [...new Set(nextFocusRaw
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean))];
+    const invalidFocus = nextFocus.find((item) => !WORKOUT_FOCUS_OPTIONS.includes(item));
+    if (invalidFocus) return setStatus(`Invalid focus: ${invalidFocus}`, "error");
+    if (nextFocus.length > 8) return setStatus("Focus is limited to 8 items.", "error");
+    if (JSON.stringify(nextFocus) === JSON.stringify(currentFocus)) return;
+    try {
+        els.editWorkoutFocusBtn.disabled = true;
+        els.editWorkoutFocusBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> Saving...`;
+        await updateDoc(doc(db, "users", currentUser.uid, "workouts", currentModalWorkoutId), {
+          focus: nextFocus,
+          updatedAtMs: Date.now(),
+        });
+        currentModalWorkout = { ...(currentModalWorkout || {}), id: currentModalWorkoutId, focus: nextFocus };
+        showWorkoutDetailsModal(currentModalWorkout, currentModalDisplayDate);
+        resetWorkoutAnalyticsCaches();
+        await loadAnalytics();
+        setStatus("Workout focus updated.", "info");
+    } catch (e) {
+        console.error("Failed to update workout focus", e);
+        setStatus("Failed to update workout focus.", "error");
+    } finally {
+        els.editWorkoutFocusBtn.disabled = false;
+        els.editWorkoutFocusBtn.innerHTML = `<i class="fa-solid fa-bullseye mr-1"></i> Edit Focus`;
     }
 });
 els.deleteWorkoutBtn?.addEventListener("click", async () => {
