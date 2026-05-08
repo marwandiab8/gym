@@ -1328,31 +1328,74 @@ function workoutSummariesCollection() {
   return collection(db, "users", currentUser.uid, "workout_summaries");
 }
 
+function mergeWorkoutLikeRecords(...lists) {
+  const byId = new Map();
+  const scoreRecord = (record) => {
+    let score = 0;
+    if (Array.isArray(record?.exerciseSummaries) && record.exerciseSummaries.length) score += 4;
+    if (Array.isArray(record?.exercises) && record.exercises.length) score += 3;
+    if (Array.isArray(record?.focus) && record.focus.length) score += 2;
+    if (typeof record?.routineName === "string" && record.routineName.trim()) score += 1;
+    return score;
+  };
+
+  lists.forEach((list) => {
+    (list || []).forEach((record) => {
+      if (!record?.id) return;
+      const existing = byId.get(record.id);
+      if (!existing) {
+        byId.set(record.id, record);
+        return;
+      }
+      const merged = { ...existing, ...record };
+      const existingScore = scoreRecord(existing);
+      const nextScore = scoreRecord(record);
+      if (nextScore > existingScore) {
+        byId.set(record.id, merged);
+        return;
+      }
+      if (nextScore === existingScore && (Number(record.updatedAtMs) || 0) >= (Number(existing.updatedAtMs) || 0)) {
+        byId.set(record.id, merged);
+      } else {
+        byId.set(record.id, { ...record, ...existing });
+      }
+    });
+  });
+
+  return [...byId.values()];
+}
+
 async function loadChartWorkoutsSample() {
   if (!currentUser) return [];
   if (chartWorkoutsSample.length) return chartWorkoutsSample;
   if (!chartWorkoutsLoadPromise) {
     chartWorkoutsLoadPromise = (async () => {
+      let summaryRows = [];
+      let rawRows = [];
       try {
         const summarySnap = await getDocs(
           query(workoutSummariesCollection(), orderBy("updatedAtMs", "desc"), limit(120))
         );
-        chartWorkoutsSample = summarySnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        if (chartWorkoutsSample.length === 0) {
-          const fallbackSnap = await getDocs(
-            query(
-              collection(db, "users", currentUser.uid, "workouts"),
-              where("status", "==", "final"),
-              orderBy("updatedAtMs", "desc"),
-              limit(60)
-            )
-          );
-          chartWorkoutsSample = fallbackSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        }
+        summaryRows = summarySnap.docs.map((d) => ({ id: d.id, ...d.data() }));
       } catch (e) {
-        console.warn("Chart workout sample query failed", e);
-        chartWorkoutsSample = [];
+        console.warn("Chart workout summary query failed", e);
+      }
+      try {
+        const rawSnap = await getDocs(
+          query(
+            collection(db, "users", currentUser.uid, "workouts"),
+            where("status", "==", "final"),
+            orderBy("updatedAtMs", "desc"),
+            limit(120)
+          )
+        );
+        rawRows = rawSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      } catch (e) {
+        console.warn("Chart raw workout query failed", e);
       } finally {
+        chartWorkoutsSample = mergeWorkoutLikeRecords(summaryRows, rawRows)
+          .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0))
+          .slice(0, 120);
         chartWorkoutsLoadPromise = null;
       }
       return chartWorkoutsSample;
@@ -1454,15 +1497,13 @@ async function loadAnalytics() {
     const workoutsCol = collection(db, "users", currentUser.uid, "workouts");
     let totalWorkoutsDisplay = "0";
     try {
-      const countSnap = await getCountFromServer(summariesCol);
-      const summaryCount = Number(countSnap.data().count || 0);
-      totalWorkoutsDisplay = String(summaryCount);
-      if (summaryCount === 0) {
-        const fallbackCountSnap = await getCountFromServer(
-          query(workoutsCol, where("status", "==", "final"))
-        );
-        totalWorkoutsDisplay = String(fallbackCountSnap.data().count || 0);
-      }
+      const [summaryCountSnap, rawCountSnap] = await Promise.all([
+        getCountFromServer(summariesCol).catch(() => null),
+        getCountFromServer(query(workoutsCol, where("status", "==", "final"))).catch(() => null),
+      ]);
+      const summaryCount = Number(summaryCountSnap?.data().count || 0);
+      const rawCount = Number(rawCountSnap?.data().count || 0);
+      totalWorkoutsDisplay = String(Math.max(summaryCount, rawCount));
     } catch (e) {
       console.warn("Workout summary count aggregation failed; using capped read fallback.", e);
       const approx = await getDocs(query(workoutsCol, where("status", "==", "final"), limit(500)));
@@ -1474,33 +1515,46 @@ async function loadAnalytics() {
     minD.setDate(minD.getDate() - 89);
     const minDateStr = toLocalISODate(minD);
 
-    let snapWindow;
+    let summaryWindowRows = [];
     try {
-      snapWindow = await getDocs(query(summariesCol, where("date", ">=", minDateStr), limit(180)));
+      const snapWindow = await getDocs(query(summariesCol, where("date", ">=", minDateStr), limit(180)));
+      summaryWindowRows = snapWindow.docs.map((d) => ({ id: d.id, ...d.data() }));
     } catch (e) {
       console.warn("Analytics summary date-window query failed", e);
-      snapWindow = null;
     }
-    analyticsWindowWorkouts = snapWindow ? snapWindow.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
-    if (analyticsWindowWorkouts.length === 0) {
-      const fallbackWindow = await getDocs(
-        query(workoutsCol, where("status", "==", "final"), where("date", ">=", minDateStr), limit(120))
+    let rawWindowRows = [];
+    try {
+      const rawWindow = await getDocs(
+        query(workoutsCol, where("status", "==", "final"), where("date", ">=", minDateStr), limit(180))
       );
-      analyticsWindowWorkouts = fallbackWindow.docs.map((d) => ({ id: d.id, ...d.data() }));
+      rawWindowRows = rawWindow.docs.map((d) => ({ id: d.id, ...d.data() }));
+    } catch (e) {
+      console.warn("Analytics raw date-window query failed", e);
     }
+    analyticsWindowWorkouts = mergeWorkoutLikeRecords(summaryWindowRows, rawWindowRows);
 
-    let recentList = [];
+    let recentSummaryRows = [];
     try {
       const snapRecent = await getDocs(
         query(summariesCol, orderBy("updatedAtMs", "desc"), limit(8))
       );
-      recentList = snapRecent.docs.map((d) => ({ id: d.id, ...d.data() }));
+      recentSummaryRows = snapRecent.docs.map((d) => ({ id: d.id, ...d.data() }));
     } catch (e) {
-      recentList = [];
+      recentSummaryRows = [];
     }
-    if (recentList.length === 0) {
-      recentList = [...analyticsWindowWorkouts].sort((a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)).slice(0, 8);
+    let recentRawRows = [];
+    try {
+      const rawRecent = await getDocs(
+        query(workoutsCol, where("status", "==", "final"), orderBy("updatedAtMs", "desc"), limit(8))
+      );
+      recentRawRows = rawRecent.docs.map((d) => ({ id: d.id, ...d.data() }));
+    } catch (e) {
+      recentRawRows = [];
     }
+    let recentList = mergeWorkoutLikeRecords(recentSummaryRows, recentRawRows)
+      .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0))
+      .slice(0, 8);
+    if (recentList.length === 0) recentList = [...analyticsWindowWorkouts].sort((a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)).slice(0, 8);
 
     els.recentWorkouts.innerHTML = "";
     const workoutsByDate = {};
