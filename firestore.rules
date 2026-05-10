@@ -17,6 +17,10 @@ service cloud.firestore {
       return value == null || (value is string && value.size() <= maxLen);
     }
 
+    function isOptionalInt(value) {
+      return value == null || value is int;
+    }
+
     function isStringList(value, maxItems) {
       return value is list && value.size() <= maxItems;
     }
@@ -55,9 +59,14 @@ service cloud.firestore {
         "focus",
         "templateId",
         "notes",
-        "finishedAt"
+        "finishedAt",
+        "finalizationId",
+        "finalizedAtMs",
+        "finalizedByUid",
+        "archivedAtMs",
+        "archivedByUid"
       ]) &&
-      (data.status == "draft" || data.status == "final") &&
+      (data.status == "draft" || data.status == "final" || data.status == "archived") &&
       isNonEmptyString(data.date, 20) &&
       validUnit(data.unit) &&
       data.exercises is list &&
@@ -66,7 +75,12 @@ service cloud.firestore {
       isNonEmptyString(data.routineName, 80) &&
       isStringList(data.focus, 8) &&
       isOptionalString(data.templateId, 120) &&
-      isOptionalString(data.notes, 2000);
+      isOptionalString(data.notes, 2000) &&
+      isOptionalString(data.finalizationId, 120) &&
+      isOptionalInt(data.finalizedAtMs) &&
+      isOptionalString(data.finalizedByUid, 120) &&
+      isOptionalInt(data.archivedAtMs) &&
+      isOptionalString(data.archivedByUid, 120);
     }
 
     function validPr(data) {

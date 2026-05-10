@@ -45,6 +45,8 @@ const LOCAL_DRAFT_KEY_PREFIX = "k2_gym_workout_draft_v1:";
 const AUTOSAVE_DEBOUNCE_MS = 800;
 const AI_PROMPT_MAX_LENGTH = 600;
 const WORKOUT_FOCUS_OPTIONS = ["Legs", "Chest", "Shoulders", "Back"];
+const INTEGRITY_CHECK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const INTEGRITY_CHECK_KEY_PREFIX = "k2_integrity_check_v1:";
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
 
@@ -123,6 +125,41 @@ function clearLocalDraft() {
   clearLocalDraftForUid(currentUser?.uid);
 }
 
+function integrityCheckStorageKey(uid) {
+  return uid ? `${INTEGRITY_CHECK_KEY_PREFIX}${uid}` : null;
+}
+
+function markIntegrityCheckRun(uid) {
+  const key = integrityCheckStorageKey(uid);
+  if (!key) return;
+  try { localStorage.setItem(key, String(Date.now())); } catch (_) { /* storage unavailable */ }
+}
+
+function shouldRunIntegrityCheck(uid) {
+  const key = integrityCheckStorageKey(uid);
+  if (!key) return false;
+  try {
+    const last = Number(localStorage.getItem(key) || 0);
+    return !last || (Date.now() - last) >= INTEGRITY_CHECK_COOLDOWN_MS;
+  } catch (_) {
+    return true;
+  }
+}
+
+async function runIntegrityCheckIfDue(force = false) {
+  if (!currentUser) return null;
+  if (!force && !shouldRunIntegrityCheck(currentUser.uid)) return null;
+  try {
+    const runWorkoutIntegrityCheck = httpsCallable(functions, "runWorkoutIntegrityCheck");
+    const response = await runWorkoutIntegrityCheck({});
+    markIntegrityCheckRun(currentUser.uid);
+    return response?.data?.report || null;
+  } catch (e) {
+    console.warn("Integrity check failed", e);
+    return null;
+  }
+}
+
 /** Snapshot for local backup (same device, survives refresh / offline). */
 function buildLocalDraftSnapshot() {
   if (!activeWorkoutRef || !currentUser) return null;
@@ -137,6 +174,18 @@ function buildLocalDraftSnapshot() {
     unit: els.unitSelect?.value || "lb",
     notes: workoutState.notes || "",
   };
+}
+
+function draftHasMeaningfulProgress(draft) {
+  if (!draft || typeof draft !== "object") return false;
+  const exercises = Array.isArray(draft.exercises) ? draft.exercises : [];
+  if (exercises.length > 0) return true;
+  if (Array.isArray(draft.focus) && draft.focus.length > 0) return true;
+  if (typeof draft.notes === "string" && draft.notes.trim()) return true;
+  if (typeof draft.templateId === "string" && draft.templateId.trim()) return true;
+  const routineName = String(draft.routineName || "").trim();
+  if (routineName && routineName !== "Custom Workout") return true;
+  return false;
 }
 
 function writeLocalDraftSnapshot() {
@@ -263,17 +312,20 @@ function mergeLocalDraftIfNewer(cloudDraft, localSnap) {
 async function resolveDraftRowForResume() {
   const cloudList = await fetchSortedDraftWorkouts();
   const localSnap = readLocalDraftSnapshot();
-  if (cloudList.length === 0) {
-    if (!localSnap?.workoutId) return null;
+  const meaningfulCloudList = cloudList.filter(draftHasMeaningfulProgress);
+  const meaningfulLocalSnap = draftHasMeaningfulProgress(localSnap) ? localSnap : null;
+  if (meaningfulCloudList.length === 0) {
+    if (!meaningfulLocalSnap?.workoutId) return null;
     const s = await getDoc(doc(db, "users", currentUser.uid, "workouts", localSnap.workoutId));
     if (!s.exists() || s.data().status !== "draft") {
       clearLocalDraft();
       return null;
     }
-    return mergeLocalDraftIfNewer({ id: s.id, ...s.data() }, localSnap);
+    return mergeLocalDraftIfNewer({ id: s.id, ...s.data() }, meaningfulLocalSnap);
   }
-  let best = cloudList[0];
-  best = mergeLocalDraftIfNewer(best, localSnap);
+  let best = meaningfulCloudList[0];
+  best = mergeLocalDraftIfNewer(best, meaningfulLocalSnap);
+  if (!draftHasMeaningfulProgress(best)) return null;
   return best;
 }
 
@@ -288,9 +340,8 @@ async function updateResumeDraftButtonState() {
     return;
   }
   try {
-    const cloudList = await fetchSortedDraftWorkouts();
-    const localSnap = readLocalDraftSnapshot();
-    els.resumeDraftBtn.disabled = cloudList.length === 0 && !(localSnap && localSnap.workoutId);
+    const row = await resolveDraftRowForResume();
+    els.resumeDraftBtn.disabled = !row;
   } catch (_) {
     els.resumeDraftBtn.disabled = true;
   }
@@ -334,23 +385,28 @@ async function completeWorkoutFromDraft() {
   if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = true;
   setStatus("Finishing...", "info");
   try {
-    await setDoc(activeWorkoutRef, {
-      status: "final",
-      finishedAt: serverTimestamp(),
-      updatedAtMs: Date.now(),
+    writeLocalDraftSnapshot();
+    const finalizeWorkout = httpsCallable(functions, "finalizeWorkout");
+    const finalizationId = `${activeWorkoutRef.id}_${Date.now()}`;
+    const response = await finalizeWorkout({
+      workoutId: activeWorkoutRef.id,
+      finalizationId,
       exercises: finalExercises,
       routineName: workoutState.routineName,
       focus: workoutState.focus,
       date: els.dateInput?.value || todayISO(),
       unit: els.unitSelect?.value || "lb",
       notes: workoutState.notes || "",
-    }, { merge: true });
+      templateId: workoutState.templateId,
+    });
+    if (!response?.data?.ok) throw new Error("Finalize did not return success.");
     invalidateFinalSetsCache();
     resetWorkoutAnalyticsCaches();
-    await updatePRsAfterWorkout(finalExercises);
+    await runIntegrityCheckIfDue(true);
     clearLocalDraft();
     resetWorkoutState({ clearLocal: false });
-    setStatus("Workout finished & PRs updated! 🎉", "info");
+    const savedDate = response.data.workoutDate || (els.dateInput?.value || todayISO());
+    setStatus(`Workout verified and saved for ${savedDate}.`, "info");
     setAuthUI();
     await updateResumeDraftButtonState();
     await loadAnalytics();
@@ -381,18 +437,18 @@ async function offerDraftRecoveryIfNeeded() {
   if (!currentUser || activeWorkoutRef || draftRecoveryShownThisSession) return;
   const uidAtStart = currentUser.uid;
   await updateResumeDraftButtonState();
-  const cloudList = await fetchSortedDraftWorkouts();
-  const localSnap = readLocalDraftSnapshot();
+  const row = await resolveDraftRowForResume();
   if (!currentUser || currentUser.uid !== uidAtStart || activeWorkoutRef || draftRecoveryShownThisSession) return;
-  if (cloudList.length === 0 && !(localSnap && localSnap.workoutId)) return;
+  if (!row) return;
   draftRecoveryShownThisSession = true;
-  const preview = cloudList[0];
+  const localSnap = readLocalDraftSnapshot();
+  const preview = row;
   const parts = [];
   if (preview) {
     parts.push(`Last saved: ${new Date(preview.updatedAtMs || Date.now()).toLocaleString()}`);
     parts.push(`${(preview.exercises || []).length} exercise(s) in cloud draft.`);
   }
-  if (localSnap && localSnap.workoutId) parts.push("A backup exists on this device (used if it is newer).");
+  if (draftHasMeaningfulProgress(localSnap) && localSnap?.workoutId) parts.push("A backup exists on this device (used if it is newer).");
   if (els.draftRecoveryText) els.draftRecoveryText.textContent = parts.join(" ");
   els.draftRecoveryDialog?.showModal();
 }
@@ -571,6 +627,7 @@ onAuthStateChanged(auth, async (user) => {
   runBootstrapStep("prs listener", async () => listenToPRs());
   runBootstrapStep("analytics", () => loadAnalytics());
   runBootstrapStep("templates", () => loadTemplates());
+  runBootstrapStep("integrity check", () => runIntegrityCheckIfDue());
   setAuthUI();
   setActiveBadge();
   renderWorkoutBuilder();
@@ -1472,11 +1529,29 @@ function heatmapCellVisual(focuses, hasWorkout) {
   };
 }
 
+function parseStoredWorkoutDate(dateValue) {
+  if (typeof dateValue !== "string") return null;
+  const trimmed = dateValue.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  const parsed = new Date(`${trimmed}T12:00:00`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function workoutDisplayMeta(w) {
+  const storedDate = parseStoredWorkoutDate(w?.date);
   let displayDate = w.date;
   let timeString = "";
   let dDate = w.date;
-  if (w.updatedAtMs) {
+  if (storedDate) {
+    displayDate = storedDate.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    dDate = toLocalISODate(storedDate);
+    if (w.updatedAtMs) {
+      const updatedDate = new Date(w.updatedAtMs);
+      if (!Number.isNaN(updatedDate.getTime())) {
+        timeString = updatedDate.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+      }
+    }
+  } else if (w.updatedAtMs) {
     const dObj = new Date(w.updatedAtMs);
     displayDate = dObj.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
     timeString = dObj.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
@@ -1488,6 +1563,19 @@ function workoutDisplayMeta(w) {
     dDate = toLocalISODate(dObj);
   }
   return { displayDate, timeString, dDate };
+}
+
+function workoutDateSortMs(workout) {
+  const storedDate = parseStoredWorkoutDate(workout?.date);
+  if (storedDate) return storedDate.getTime();
+  const updatedAtMs = Number(workout?.updatedAtMs) || 0;
+  return updatedAtMs > 0 ? updatedAtMs : 0;
+}
+
+function compareWorkoutsByDateDesc(a, b) {
+  const dateDiff = workoutDateSortMs(b) - workoutDateSortMs(a);
+  if (dateDiff !== 0) return dateDiff;
+  return (Number(b?.updatedAtMs) || 0) - (Number(a?.updatedAtMs) || 0);
 }
 
 async function loadAnalytics() {
@@ -1551,10 +1639,11 @@ async function loadAnalytics() {
     } catch (e) {
       recentRawRows = [];
     }
-    let recentList = mergeWorkoutLikeRecords(recentSummaryRows, recentRawRows)
-      .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0))
+    const mergedRecentRows = mergeWorkoutLikeRecords(recentSummaryRows, recentRawRows);
+    let recentList = (analyticsWindowWorkouts.length ? [...analyticsWindowWorkouts] : mergedRecentRows)
+      .sort(compareWorkoutsByDateDesc)
       .slice(0, 8);
-    if (recentList.length === 0) recentList = [...analyticsWindowWorkouts].sort((a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)).slice(0, 8);
+    if (recentList.length === 0) recentList = [...mergedRecentRows].sort(compareWorkoutsByDateDesc).slice(0, 8);
 
     els.recentWorkouts.innerHTML = "";
     const workoutsByDate = {};
@@ -1649,12 +1738,18 @@ async function openWorkoutDetailsFromSummary(summary, displayDate) {
   try {
     const snap = await getDoc(doc(db, "users", currentUser.uid, "workouts", summary.id));
     if (!snap.exists()) {
-      setStatus("Workout details are no longer available.", "error");
+      showWorkoutDetailsModal(summary, displayDate);
+      setStatus("Loaded summary view. Full workout details are no longer available.", "info");
       return;
     }
     showWorkoutDetailsModal({ id: snap.id, ...snap.data() }, displayDate);
   } catch (e) {
     console.error("Workout details load failed", e);
+    if (Array.isArray(summary.exerciseSummaries) && summary.exerciseSummaries.length) {
+      showWorkoutDetailsModal(summary, displayDate);
+      setStatus("Loaded summary view because the full workout could not be fetched.", "info");
+      return;
+    }
     setStatus("Could not load workout details.", "error");
   }
 }
@@ -1663,15 +1758,40 @@ function showWorkoutDetailsModal(workout, displayDate) {
     currentModalWorkout = workout;
     currentModalDisplayDate = displayDate;
     currentModalWorkoutId = workout.id; els.modalTitle.textContent = `Workout Details`;
+    if (els.deleteWorkoutBtn) els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-box-archive mr-1"></i> Archive Workout`;
     const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
     let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div>`;
-    (workout.exercises || []).forEach(ex => {
+    const displayExercises = Array.isArray(workout.exercises) && workout.exercises.length
+      ? workout.exercises
+      : (workout.exerciseSummaries || []).map((ex) => ({
+          name: ex.exerciseName || ex.name || "Exercise",
+          summaryOnly: true,
+          bestWeight: ex.bestWeight,
+          bestReps: ex.bestReps,
+          bestVolume: ex.bestVolume,
+        }));
+    if (!displayExercises.length) {
+        contentHtml += `<div class="text-sm text-zinc-500">No exercise details recorded.</div>`;
+    }
+    displayExercises.forEach(ex => {
         let timeHtml = ""; let tStart = ex.firstEditTime || ex.addedAt; let tEnd = ex.lastEditTime || ex.firstEditTime || ex.addedAt;
         if (tStart && tEnd && Math.abs(tEnd - tStart) > 60000) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)} - ${formatTimeDisplay(tEnd)}</span>`; } else if (tStart) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)}</span>`; }
         const exNote = (ex.exerciseNote && String(ex.exerciseNote).trim()) ? `<div class="text-sm text-zinc-400 mb-3 pl-1 border-l-2 border-emerald-500/50 py-1"><span class="text-zinc-500 text-xs uppercase tracking-wide mr-2">Notes</span>${escapeHtml(ex.exerciseNote)}</div>` : "";
         contentHtml += `<div class="mb-6"><div class="font-bold text-lg text-zinc-100 mb-3 flex items-center gap-2">${escapeHtml(ex.name)} ${timeHtml}</div>${exNote}`;
-        const validSets = (ex.sets || []).filter(s => s.weight && s.weight.toString().trim() !== "");
-        if(validSets.length === 0) { contentHtml += `<div class="text-sm text-zinc-500">No valid sets recorded.</div>`; } else { validSets.forEach((s, i) => { contentHtml += `<div class="flex gap-4 text-sm bg-zinc-900 p-2 rounded-lg mb-1 border border-zinc-800"><div class="text-zinc-500 w-12">Set ${i+1}</div><div class="font-medium">${s.weight} ${workout.unit || 'lb'}</div><div class="font-medium text-emerald-400">× ${s.reps} reps</div></div>`; }); }
+        if (ex.summaryOnly) {
+            const bestWeight = Number(ex.bestWeight) || 0;
+            const bestReps = Number(ex.bestReps) || 0;
+            const bestVolume = Number(ex.bestVolume) || 0;
+            if (bestWeight > 0 || bestReps > 0 || bestVolume > 0) {
+                const bestWeightLabel = bestWeight > 0 ? `${bestWeight} ${workout.unit || 'lb'}` : "Bodyweight";
+                contentHtml += `<div class="text-sm bg-zinc-900 p-3 rounded-lg border border-zinc-800"><span class="text-zinc-400">Best logged set:</span> <span class="font-medium">${bestWeightLabel}</span> <span class="font-medium text-emerald-400">× ${bestReps} reps</span> <span class="text-zinc-500 ml-2">(volume ${bestVolume})</span></div>`;
+            } else {
+                contentHtml += `<div class="text-sm text-zinc-500">Summary available, but no set-level details were stored.</div>`;
+            }
+        } else {
+            const validSets = (ex.sets || []).filter(s => s.weight && s.weight.toString().trim() !== "");
+            if(validSets.length === 0) { contentHtml += `<div class="text-sm text-zinc-500">No valid sets recorded.</div>`; } else { validSets.forEach((s, i) => { contentHtml += `<div class="flex gap-4 text-sm bg-zinc-900 p-2 rounded-lg mb-1 border border-zinc-800"><div class="text-zinc-500 w-12">Set ${i+1}</div><div class="font-medium">${s.weight} ${workout.unit || 'lb'}</div><div class="font-medium text-emerald-400">× ${s.reps} reps</div></div>`; }); }
+        }
         contentHtml += `</div>`;
     });
     els.modalContent.innerHTML = contentHtml; els.workoutModal.showModal();
@@ -1740,9 +1860,22 @@ els.editWorkoutFocusBtn?.addEventListener("click", async () => {
 });
 els.deleteWorkoutBtn?.addEventListener("click", async () => {
     if (!currentModalWorkoutId || !currentUser) return;
-    if (confirm("Permanently delete this workout? This will remove it from your analytics and charts.")) {
-        try { els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> Deleting...`; els.deleteWorkoutBtn.disabled = true; await deleteDoc(doc(db, "users", currentUser.uid, "workouts", currentModalWorkoutId)); invalidateFinalSetsCache(); resetWorkoutAnalyticsCaches(); els.workoutModal.close(); await loadAnalytics(); await populateDropdowns(); scheduleAnalyticsRefresh(); setStatus("Workout deleted", "info"); } 
-        catch (e) { alert("Failed to delete the workout."); } finally { els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-trash mr-1"></i> Delete Workout`; els.deleteWorkoutBtn.disabled = false; }
+    if (confirm("Archive this workout? It will disappear from active analytics, but it will not be permanently deleted.")) {
+        try {
+          els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> Archiving...`;
+          els.deleteWorkoutBtn.disabled = true;
+          const archiveWorkout = httpsCallable(functions, "archiveWorkout");
+          await archiveWorkout({ workoutId: currentModalWorkoutId });
+          invalidateFinalSetsCache();
+          resetWorkoutAnalyticsCaches();
+          els.workoutModal.close();
+          await runIntegrityCheckIfDue(true);
+          await loadAnalytics();
+          await populateDropdowns();
+          scheduleAnalyticsRefresh();
+          setStatus("Workout archived", "info");
+        } 
+        catch (e) { alert("Failed to archive the workout."); } finally { els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-box-archive mr-1"></i> Archive Workout`; els.deleteWorkoutBtn.disabled = false; }
     }
 });
 els.closeModalBtn?.addEventListener("click", () => { currentModalWorkout = null; currentModalWorkoutId = null; currentModalDisplayDate = ""; els.workoutModal.close(); });
@@ -1775,19 +1908,19 @@ function playTimerAlarm() {
 function shouldShowTimerWidget(state) {
   if (!state || typeof state !== "object") return false;
   if (state.running) return true;
-  if (state.completed) return true;
-  return typeof state.remainingSec === "number" && state.remainingSec !== TIMER_DEFAULT_SECONDS;
+  return state.visible === true;
 }
 
 function getPersistedTimerState() {
   if (isTimerRunning && timerEndAt != null) {
-    return { running: true, endAt: timerEndAt, completed: false };
+    return { running: true, endAt: timerEndAt, completed: false, visible: true };
   }
   return {
     running: false,
     endAt: null,
     remainingSec: timerSeconds,
     completed: timerSeconds <= 0,
+    visible: !els.restTimerWidget?.classList.contains("hidden"),
   };
 }
 
@@ -1913,6 +2046,8 @@ function applyTimerStateSnapshot(state, options = {}) {
 
   if (revealWidget && shouldShowTimerWidget(state)) {
     els.restTimerWidget?.classList.remove("hidden");
+  } else if (revealWidget) {
+    els.restTimerWidget?.classList.add("hidden");
   }
 }
 
@@ -1965,8 +2100,8 @@ els.toggleTimerBtn?.addEventListener("click", () => {
     timerEndAt = null;
     resetTimerVisuals();
     updateTimerDisplay();
-    persistTimerState();
   }
+  persistTimerState();
 });
 els.timerPlayPauseBtn?.addEventListener("click", () => {
     if (isTimerRunning) {
@@ -2008,6 +2143,7 @@ els.timerStopBtn?.addEventListener("click", () => {
 });
 els.timerCloseBtn?.addEventListener("click", () => {
   els.restTimerWidget?.classList.add("hidden");
+  persistTimerState();
 });
 
 // ==================== CHARTS ====================
