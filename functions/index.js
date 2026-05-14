@@ -174,6 +174,25 @@ function sanitizeFinalizeRequest(data) {
   return sanitized;
 }
 
+function sanitizeDraftRequest(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid draft payload.");
+  }
+  const date = normalizeDateString(data.date);
+  if (!date) {
+    throw new functions.https.HttpsError("invalid-argument", "Draft date is required.");
+  }
+  return {
+    date,
+    unit: normalizeUnit(data.unit),
+    exercises: Array.isArray(data.exercises) ? data.exercises.slice(0, MAX_WORKOUT_EXERCISES) : [],
+    routineName: clampString(data.routineName, 80, "Custom Workout"),
+    focus: normalizeStringList(data.focus, 8, 40),
+    templateId: clampString(data.templateId, 120) || null,
+    notes: clampString(data.notes, 2000),
+  };
+}
+
 function collectExerciseIds(workout) {
   return [...new Set((workout?.exercises || [])
     .map((exercise) => exercise?.exerciseId)
@@ -468,14 +487,25 @@ exports.finalizeWorkout = functions
       };
 
       tx.set(workoutRef, finalizedWorkout, { merge: true });
-      const prUpdates = await syncPrsForWorkoutInTransaction(
-        tx,
-        uid,
-        payload.workoutId,
-        finalizedWorkout,
-        payload.finalizationId,
-        nowMs
-      );
+      let prUpdates = [];
+      let prSyncError = null;
+      try {
+        prUpdates = await syncPrsForWorkoutInTransaction(
+          tx,
+          uid,
+          payload.workoutId,
+          finalizedWorkout,
+          payload.finalizationId,
+          nowMs
+        );
+      } catch (error) {
+        prSyncError = String(error?.message || error);
+        console.error("PR sync failed during finalize transaction", {
+          uid,
+          workoutId: payload.workoutId,
+          message: prSyncError,
+        });
+      }
       tx.set(summaryRef, buildWorkoutSummaryRecord(payload.workoutId, finalizedWorkout), { merge: true });
       tx.set(receiptRef, {
         workoutId: payload.workoutId,
@@ -486,43 +516,50 @@ exports.finalizeWorkout = functions
         finalizedAtMs: nowMs,
         verified: false,
         prUpdates,
+        prSyncError,
       }, { merge: true });
 
-      return { workout: finalizedWorkout, prUpdates, alreadyFinalized: false };
+      return { workout: finalizedWorkout, prUpdates, alreadyFinalized: false, prSyncError };
     });
 
+    let verificationWarning = txResult.prSyncError || "";
+    try {
+      await verifyFinalizedWorkout(uid, payload.workoutId, payload.finalizationId);
+    } catch (error) {
+      verificationWarning = verificationWarning || String(error?.message || error);
+    }
     try {
       await syncLastSetsForExercises(uid, collectExerciseIds(txResult.workout));
-      await verifyFinalizedWorkout(uid, payload.workoutId, payload.finalizationId);
+    } catch (error) {
+      verificationWarning = verificationWarning || String(error?.message || error);
+    }
+    try {
       const report = await runIntegrityCheckAndRepair(uid);
       await receiptRef.set({
-        verified: true,
+        verified: !verificationWarning,
         verifiedAtMs: Date.now(),
         integrityIssueCount: Number(report.issueCount) || 0,
+        verificationError: verificationWarning || null,
+        verificationFailedAtMs: verificationWarning ? Date.now() : null,
       }, { merge: true });
-      return {
-        ok: true,
-        workoutId: payload.workoutId,
-        workoutDate: txResult.workout.date,
-        finalizationId: payload.finalizationId,
-        prUpdates: txResult.prUpdates,
-        alreadyFinalized: txResult.alreadyFinalized,
-      };
     } catch (error) {
-      console.error("Finalize workout verification failed", {
-        uid,
-        workoutId: payload.workoutId,
-        message: error?.message || String(error),
-      });
+      verificationWarning = verificationWarning || String(error?.message || error);
       await receiptRef.set({
         verified: false,
-        verificationError: String(error?.message || error),
+        verificationError: verificationWarning,
         verificationFailedAtMs: Date.now(),
       }, { merge: true }).catch(() => null);
-      throw error instanceof functions.https.HttpsError
-        ? error
-        : new functions.https.HttpsError("internal", "Workout save could not be verified.");
     }
+
+    return {
+      ok: true,
+      workoutId: payload.workoutId,
+      workoutDate: txResult.workout.date,
+      finalizationId: payload.finalizationId,
+      prUpdates: txResult.prUpdates,
+      alreadyFinalized: txResult.alreadyFinalized,
+      verificationWarning: verificationWarning || null,
+    };
   });
 
 exports.archiveWorkout = functions
@@ -605,6 +642,44 @@ exports.runWorkoutIntegrityCheck = functions
     return { ok: true, report };
   });
 
+exports.createWorkoutDraft = functions
+  .runWith({
+    timeoutSeconds: 60,
+    memory: "256MB",
+  })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+    }
+    const payload = sanitizeDraftRequest(data);
+    const nowMs = Date.now();
+    const workoutRef = admin.firestore().collection(`users/${uid}/workouts`).doc();
+    await workoutRef.set({
+      status: WORKOUT_STATUSES.DRAFT,
+      date: payload.date,
+      unit: payload.unit,
+      exercises: payload.exercises,
+      startedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAtMs: nowMs,
+      routineName: payload.routineName,
+      focus: payload.focus,
+      templateId: payload.templateId,
+      notes: payload.notes,
+      finalizationId: null,
+      finalizedAtMs: null,
+      finalizedByUid: null,
+      archivedAtMs: null,
+      archivedByUid: null,
+    }, { merge: true });
+    return {
+      ok: true,
+      workoutId: workoutRef.id,
+      updatedAtMs: nowMs,
+    };
+  });
+
 exports.generateAiRoutine = functions
   .runWith({
     secrets: ["OPENAI_API_KEY"],
@@ -625,9 +700,11 @@ exports.generateAiRoutine = functions
 
     const prompt = normalizePrompt(data.prompt);
     if (prompt.length < AI_PROMPT_MIN_LENGTH) {
+      console.warn("AI request rejected: prompt too short", { uid, promptLength: prompt.length });
       return { ok: false, exercises: [], error: "Describe the workout you want in a bit more detail." };
     }
     if (prompt.length > AI_PROMPT_MAX_LENGTH) {
+      console.warn("AI request rejected: prompt too long", { uid, promptLength: prompt.length });
       return { ok: false, exercises: [], error: `Prompt is too long. Keep it under ${AI_PROMPT_MAX_LENGTH} characters.` };
     }
 
@@ -685,6 +762,13 @@ exports.generateAiRoutine = functions
       const rawContent = apiData?.choices?.[0]?.message?.content || "";
       const parsed = extractJsonCandidate(rawContent);
       const exercises = normalizeAiExercises(parsed);
+      console.warn("AI routine generation succeeded", {
+        svc: "generateAiRoutine",
+        kind: "success",
+        uid,
+        count: exercises.length,
+        promptLen: prompt.length,
+      });
 
       return {
         ok: true,
@@ -700,6 +784,7 @@ exports.generateAiRoutine = functions
       console.error("AI generation failed", {
         uid,
         message: error?.message || String(error),
+        promptLength: prompt.length,
       });
       return {
         ok: false,

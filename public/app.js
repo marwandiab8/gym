@@ -29,26 +29,124 @@ const els = {
   mobileNavPanel: document.getElementById("mobileNavPanel"),
   aiErrorBanner: document.getElementById("aiErrorBanner"),
   userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"),
-  workoutModal: document.getElementById("workoutModal"), modalTitle: document.getElementById("modalTitle"), modalContent: document.getElementById("modalContent"), closeModalBtn: document.getElementById("closeModalBtn"), deleteWorkoutBtn: document.getElementById("deleteWorkoutBtn"),
+  workoutModal: document.getElementById("workoutModal"), modalTitle: document.getElementById("modalTitle"), modalContent: document.getElementById("modalContent"), closeModalBtn: document.getElementById("closeModalBtn"),
   toggleTimerBtn: document.getElementById("toggleTimerBtn"), restTimerWidget: document.getElementById("restTimerWidget"), timerDisplay: document.getElementById("timerDisplay"), timerAddBtn: document.getElementById("timerAddBtn"), timerPlayPauseBtn: document.getElementById("timerPlayPauseBtn"), timerStopBtn: document.getElementById("timerStopBtn"), timerCloseBtn: document.getElementById("timerCloseBtn"),
   chartExerciseSelect: document.getElementById("chartExerciseSelect"),
   templateModal: document.getElementById("templateModal"), closeTemplateModalBtn: document.getElementById("closeTemplateModalBtn"), editTemplateName: document.getElementById("editTemplateName"), editTemplateExercises: document.getElementById("editTemplateExercises"), saveTemplateChangesBtn: document.getElementById("saveTemplateChangesBtn"), deleteTemplateModalBtn: document.getElementById("deleteTemplateModalBtn"),
-  aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"),
+  aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"), aiPreviewWrap: document.getElementById("aiPreviewWrap"), aiPreviewList: document.getElementById("aiPreviewList"), aiPreviewActions: document.getElementById("aiPreviewActions"), applyAiPreviewBtn: document.getElementById("applyAiPreviewBtn"), discardAiPreviewBtn: document.getElementById("discardAiPreviewBtn"),
   workoutNotesWrap: document.getElementById("workoutNotesWrap"), workoutNotesInput: document.getElementById("workoutNotesInput"),
   draftRecoveryDialog: document.getElementById("draftRecoveryDialog"), draftRecoveryText: document.getElementById("draftRecoveryText"), draftRecoveryResume: document.getElementById("draftRecoveryResume"), draftRecoveryDiscard: document.getElementById("draftRecoveryDiscard"),
   editWorkoutNameBtn: document.getElementById("editWorkoutNameBtn"),
   editWorkoutFocusBtn: document.getElementById("editWorkoutFocusBtn"),
+  themeColorInput: document.getElementById("themeColorInput"),
+  themeColorValue: document.getElementById("themeColorValue"),
+  themePreviewSwatch: document.getElementById("themePreviewSwatch"),
+  themeResetBtn: document.getElementById("themeResetBtn"),
 };
 
 let currentUser = null; let activeWorkoutRef = null; let autosaveTimer = null; let saveIndicatorTimer = null; let draftRecoveryShownThisSession = false;
+let pendingAiRoutine = null;
 const LOCAL_DRAFT_KEY_PREFIX = "k2_gym_workout_draft_v1:";
 const AUTOSAVE_DEBOUNCE_MS = 800;
 const AI_PROMPT_MAX_LENGTH = 600;
 const WORKOUT_FOCUS_OPTIONS = ["Legs", "Chest", "Shoulders", "Back"];
 const INTEGRITY_CHECK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const INTEGRITY_CHECK_KEY_PREFIX = "k2_integrity_check_v1:";
+const APP_THEME_STORAGE_KEY = "k2_app_theme_v1";
+const DEFAULT_APP_THEME_COLOR = "#34d399";
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
+
+function normalizeThemeHex(value) {
+  const hex = String(value || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(hex) ? hex : DEFAULT_APP_THEME_COLOR;
+}
+
+function hexToRgb(hex) {
+  const normalized = normalizeThemeHex(hex).slice(1);
+  return {
+    r: parseInt(normalized.slice(0, 2), 16),
+    g: parseInt(normalized.slice(2, 4), 16),
+    b: parseInt(normalized.slice(4, 6), 16),
+  };
+}
+
+function mixHex(baseHex, targetHex, weight) {
+  const base = hexToRgb(baseHex);
+  const target = hexToRgb(targetHex);
+  const blend = (from, to) => Math.round(from + (to - from) * weight);
+  const parts = [blend(base.r, target.r), blend(base.g, target.g), blend(base.b, target.b)]
+    .map((part) => part.toString(16).padStart(2, "0"));
+  return `#${parts.join("")}`;
+}
+
+function applyThemeColor(themeColor) {
+  const accent = normalizeThemeHex(themeColor);
+  const { r, g, b } = hexToRgb(accent);
+  const root = document.documentElement;
+  root.style.setProperty("--app-accent", accent);
+  root.style.setProperty("--app-accent-hover", mixHex(accent, "#ffffff", 0.12));
+  root.style.setProperty("--app-accent-soft-bg", `rgba(${r}, ${g}, ${b}, 0.14)`);
+  root.style.setProperty("--app-accent-soft-bg-strong", `rgba(${r}, ${g}, ${b}, 0.24)`);
+  root.style.setProperty("--app-accent-soft-border", `rgba(${r}, ${g}, ${b}, 0.45)`);
+  root.style.setProperty("--app-accent-shadow", `rgba(${r}, ${g}, ${b}, 0.22)`);
+  root.style.setProperty("--app-accent-text-hover", mixHex(accent, "#ffffff", 0.22));
+  root.style.setProperty("--app-accent-ring", `rgba(${r}, ${g}, ${b}, 0.34)`);
+  root.dataset.appThemeColor = accent;
+  return accent;
+}
+
+function getStoredThemeColor() {
+  try {
+    return normalizeThemeHex(localStorage.getItem(APP_THEME_STORAGE_KEY));
+  } catch (_) {
+    return DEFAULT_APP_THEME_COLOR;
+  }
+}
+
+function persistThemeColor(themeColor) {
+  const accent = applyThemeColor(themeColor);
+  try {
+    localStorage.setItem(APP_THEME_STORAGE_KEY, accent);
+  } catch (_) {
+    // Ignore storage failures and still keep the current page themed.
+  }
+  return accent;
+}
+
+function updateThemeSettingsUi() {
+  const accent = getStoredThemeColor();
+  if (els.themeColorInput) els.themeColorInput.value = accent;
+  if (els.themeColorValue) els.themeColorValue.textContent = accent.toUpperCase();
+  if (els.themePreviewSwatch) els.themePreviewSwatch.style.backgroundColor = accent;
+  document.querySelectorAll("[data-theme-color]").forEach((button) => {
+    const isActive = normalizeThemeHex(button.dataset.themeColor) === accent;
+    button.classList.toggle("is-active", isActive);
+  });
+}
+
+function initThemeSettingsPage() {
+  if (!els.themeColorInput) return;
+  updateThemeSettingsUi();
+  els.themeColorInput.addEventListener("input", (event) => {
+    const accent = persistThemeColor(event.target.value);
+    if (els.themeColorValue) els.themeColorValue.textContent = accent.toUpperCase();
+    if (els.themePreviewSwatch) els.themePreviewSwatch.style.backgroundColor = accent;
+    updateThemeSettingsUi();
+  });
+  document.querySelectorAll("[data-theme-color]").forEach((button) => {
+    button.addEventListener("click", () => {
+      persistThemeColor(button.dataset.themeColor);
+      updateThemeSettingsUi();
+    });
+  });
+  els.themeResetBtn?.addEventListener("click", () => {
+    persistThemeColor(DEFAULT_APP_THEME_COLOR);
+    updateThemeSettingsUi();
+  });
+}
+
+applyThemeColor(getStoredThemeColor());
 
 // NEW: Helper to safely format dates in your local timezone, ignoring UTC
 function toLocalISODate(d) {
@@ -217,19 +315,62 @@ async function fetchSortedDraftWorkouts() {
 
 /** Creates a new draft document in Firestore (empty or with exercises); returns the DocumentReference. */
 async function createWorkoutDraftInFirestore(initial = {}) {
-  const docRef = await addDoc(collection(db, "users", currentUser.uid, "workouts"), {
-    status: "draft",
+  const payload = {
     date: initial.date ?? els.dateInput?.value ?? todayISO(),
     unit: initial.unit ?? els.unitSelect?.value ?? "lb",
     exercises: initial.exercises ?? [],
-    startedAt: serverTimestamp(),
-    updatedAtMs: Date.now(),
     routineName: initial.routineName ?? "Custom Workout",
     focus: initial.focus ?? [],
     templateId: initial.templateId ?? null,
     notes: initial.notes ?? "",
-  });
-  return doc(db, "users", currentUser.uid, "workouts", docRef.id);
+  };
+  try {
+    const createWorkoutDraft = httpsCallable(functions, "createWorkoutDraft");
+    const response = await createWorkoutDraft(payload);
+    const workoutId = response?.data?.workoutId;
+    if (!workoutId) throw new Error("Draft creation did not return a workout id.");
+    return doc(db, "users", currentUser.uid, "workouts", workoutId);
+  } catch (e) {
+    const code = String(e?.code || "");
+    const message = String(e?.message || "");
+    const shouldFallback =
+      code === "functions/not-found" ||
+      code === "functions/unimplemented" ||
+      code === "functions/internal" ||
+      /createworkoutdraft/i.test(message) ||
+      /not found/i.test(message) ||
+      /unimplemented/i.test(message);
+    if (!shouldFallback) throw e;
+    console.warn("Falling back to client-side draft creation", { code, message });
+    const docRef = await addDoc(collection(db, "users", currentUser.uid, "workouts"), {
+      status: "draft",
+      ...payload,
+      startedAt: serverTimestamp(),
+      updatedAtMs: Date.now(),
+      finalizationId: null,
+      finalizedAtMs: null,
+      finalizedByUid: null,
+      archivedAtMs: null,
+      archivedByUid: null,
+    });
+    return doc(db, "users", currentUser.uid, "workouts", docRef.id);
+  }
+}
+
+function sanitizeDraftExercisesForStorage(exercises) {
+  return (Array.isArray(exercises) ? exercises : []).slice(0, 50).map((exercise, exerciseIndex) => ({
+    exerciseId: String(exercise?.exerciseId || "").slice(0, 120),
+    name: String(exercise?.name || "Exercise").slice(0, 120),
+    exerciseNote: String(exercise?.exerciseNote || "").slice(0, 500),
+    sets: (Array.isArray(exercise?.sets) ? exercise.sets : []).slice(0, 25).map((set) => ({
+      weight: set?.weight == null ? "" : String(set.weight).slice(0, 24),
+      reps: set?.reps == null ? "" : String(set.reps).slice(0, 24),
+      rpe: set?.rpe == null ? "" : String(set.rpe).slice(0, 24),
+    })),
+    addedAt: Number(exercise?.addedAt) || (Date.now() + exerciseIndex),
+    firstEditTime: Number(exercise?.firstEditTime) || null,
+    lastEditTime: Number(exercise?.lastEditTime) || null,
+  })).filter((exercise) => exercise.exerciseId);
 }
 
 /** Persists local snapshot first, then Firestore. On network failure, local copy still has latest edits. */
@@ -239,7 +380,7 @@ async function saveWorkoutDraft() {
   setSaveIndicator("Saving…", "saving", 0);
   const payload = {
     status: "draft",
-    exercises: workoutState.exercises,
+    exercises: sanitizeDraftExercisesForStorage(workoutState.exercises),
     routineName: workoutState.routineName,
     focus: workoutState.focus,
     templateId: workoutState.templateId,
@@ -253,6 +394,15 @@ async function saveWorkoutDraft() {
     setSaveIndicator("Saved", "saved", 2200);
   } catch (e) {
     console.error("Draft cloud save failed", e);
+    const code = String(e?.code || "");
+    if (code === "permission-denied" || code === "functions/permission-denied") {
+      setSaveIndicator("Save failed — permission denied", "error", 5000);
+      return;
+    }
+    if (code === "invalid-argument") {
+      setSaveIndicator("Save failed — invalid workout data", "error", 5000);
+      return;
+    }
     setSaveIndicator("Offline — draft saved on this device; will sync when you are back online", "offline", 0);
   }
 }
@@ -406,7 +556,13 @@ async function completeWorkoutFromDraft() {
     clearLocalDraft();
     resetWorkoutState({ clearLocal: false });
     const savedDate = response.data.workoutDate || (els.dateInput?.value || todayISO());
-    setStatus(`Workout verified and saved for ${savedDate}.`, "info");
+    const verificationWarning = String(response?.data?.verificationWarning || "").trim();
+    setStatus(
+      verificationWarning
+        ? `Workout saved for ${savedDate}. Verification warning recorded.`
+        : `Workout verified and saved for ${savedDate}.`,
+      "info"
+    );
     setAuthUI();
     await updateResumeDraftButtonState();
     await loadAnalytics();
@@ -414,7 +570,7 @@ async function completeWorkoutFromDraft() {
     scheduleAnalyticsRefresh();
   } catch (e) {
     console.error(e);
-    setStatus("Finish failed", "error");
+    setStatus(e?.message || "Finish failed", "error");
   } finally {
     if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = false;
   }
@@ -1014,6 +1170,25 @@ async function findOrCreateExerciseId(name) {
     return { id: newRef.id, name: name.trim() };
 }
 
+function buildFallbackAiExerciseId(name, index) {
+  const normalized = normalizeSearchText(name).replace(/\s+/g, "_").slice(0, 48) || "exercise";
+  return `ai_${Date.now()}_${index}_${normalized}`;
+}
+
+async function resolveExerciseIdForAi(name, index) {
+  try {
+    const match = await findOrCreateExerciseId(name);
+    if (match?.id && match?.name) return match;
+  } catch (e) {
+    if (/permission|insufficient/i.test(String(e?.message || ""))) {
+      console.warn("AI exercise lookup fell back to local-only id", { name, message: e.message });
+      return { id: buildFallbackAiExerciseId(name, index), name: name.trim() || "Exercise" };
+    }
+    throw e;
+  }
+  return { id: buildFallbackAiExerciseId(name, index), name: name.trim() || "Exercise" };
+}
+
 /** Clears cached “last sets” reads and chart workout sample after workout/PR changes. */
 function invalidateFinalSetsCache() {
   chartWorkoutsSample = [];
@@ -1064,14 +1239,97 @@ function showAiError(msg) {
   }
 }
 
-els.openAiModalBtn?.addEventListener("click", () => {
-  if (!currentUser) return alert("Please sign in to use the AI Generator.");
-  if (activeWorkoutRef && !confirm("You have an active workout in progress. Overwrite it with a new AI routine?")) return;
+function clearAiPreview() {
+  pendingAiRoutine = null;
+  if (els.aiPreviewList) els.aiPreviewList.innerHTML = "";
+  els.aiPreviewWrap?.classList.add("hidden");
+  els.aiPreviewActions?.classList.add("hidden");
+}
+
+function renderAiPreview(aiExercises) {
+  if (!els.aiPreviewList) return;
+  els.aiPreviewList.innerHTML = "";
+  aiExercises.forEach((ex, index) => {
+    const card = document.createElement("div");
+    card.className = "rounded-xl border border-zinc-800 bg-zinc-950/80 px-4 py-3";
+    card.innerHTML = `<div class="flex items-start justify-between gap-3"><div><div class="font-medium text-zinc-100">${index + 1}. ${escapeHtml(ex.name)}</div><div class="mt-1 text-sm text-zinc-400">${escapeHtml(String(ex.sets))} sets × ${escapeHtml(ex.reps)}</div></div></div>`;
+    els.aiPreviewList.appendChild(card);
+  });
+  els.aiPreviewWrap?.classList.remove("hidden");
+  els.aiPreviewActions?.classList.remove("hidden");
+}
+
+async function applyPendingAiRoutine() {
+  if (!currentUser || !pendingAiRoutine?.exercises?.length) return;
+  if (activeWorkoutRef && !confirm("You have an active workout in progress. Replace it with this AI routine?")) return;
   suppressDraftRecoveryForNewStart();
   clearAiError();
+  try {
+    els.applyAiPreviewBtn.disabled = true;
+    els.discardAiPreviewBtn.disabled = true;
+    els.applyAiPreviewBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-2"></i> Applying...`;
+
+    const newExercises = [];
+    for (const [index, aiEx] of pendingAiRoutine.exercises.entries()) {
+      const dbMatch = await resolveExerciseIdForAi(aiEx.name, index);
+      const generatedSets = [];
+      const numSets = Number(aiEx.sets) || 3;
+      for (let i = 0; i < numSets; i++) generatedSets.push({ weight: "", reps: String(aiEx.reps || "10"), rpe: "" });
+      newExercises.push({
+        exerciseId: dbMatch.id,
+        name: dbMatch.name,
+        exerciseNote: "",
+        sets: generatedSets,
+        lastSets: await fetchLastFinalSetsForExerciseSafe(dbMatch.id),
+        addedAt: Date.now(),
+        firstEditTime: null,
+        lastEditTime: null,
+      });
+    }
+
+    let targetWorkoutRef = activeWorkoutRef;
+    if (!targetWorkoutRef) {
+      targetWorkoutRef = await createWorkoutDraftInFirestore({
+        exercises: [],
+        date: todayISO(),
+        unit: els.unitSelect?.value || "lb",
+      });
+    }
+
+    activeWorkoutRef = targetWorkoutRef;
+    workoutState.exercises = newExercises;
+    workoutState.templateId = null;
+    workoutState.routineName = "AI Generated Routine";
+    workoutState.focus = [];
+    workoutState.notes = "";
+    if (els.workoutNotesInput) els.workoutNotesInput.value = "";
+    syncFocusUI();
+    await saveWorkoutDraft();
+    clearAiPreview();
+    els.aiModal?.close();
+    if (els.aiPromptInput) els.aiPromptInput.value = "";
+    setActiveBadge();
+    setAuthUI();
+    renderWorkoutBuilder();
+    await updateResumeDraftButtonState();
+    setStatus("AI routine loaded into your workout draft.", "info");
+  } catch (e) {
+    console.error("AI apply failed", e);
+    showAiError(e?.message || "Could not apply this AI routine.");
+  } finally {
+    els.applyAiPreviewBtn.disabled = false;
+    els.discardAiPreviewBtn.disabled = false;
+    els.applyAiPreviewBtn.innerHTML = `Use Routine`;
+  }
+}
+
+els.openAiModalBtn?.addEventListener("click", () => {
+  if (!currentUser) return alert("Please sign in to use the AI Generator.");
+  clearAiError();
+  clearAiPreview();
   els.aiModal?.showModal();
 });
-els.closeAiModalBtn?.addEventListener("click", () => els.aiModal?.close());
+els.closeAiModalBtn?.addEventListener("click", () => { clearAiError(); clearAiPreview(); els.aiModal?.close(); });
 
 els.generateAiBtn?.addEventListener("click", async () => {
   const prompt = (els.aiPromptInput?.value || "").trim();
@@ -1098,47 +1356,13 @@ els.generateAiBtn?.addEventListener("click", async () => {
       showAiError(payload.error || "We could not build a routine from that prompt.");
       return;
     }
-    const aiExercises = payload.exercises;
-    els.generateAiBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-2"></i> Loading Exercises...`;
-    const targetWorkoutRef = activeWorkoutRef || await createWorkoutDraftInFirestore({
-      exercises: [],
-      date: todayISO(),
-      unit: els.unitSelect?.value || "lb",
-    });
-    const newExercises = [];
-    for (const aiEx of aiExercises) {
-      const dbMatch = await findOrCreateExerciseId(aiEx.name);
-      const generatedSets = [];
-      const numSets = Number(aiEx.sets) || 3;
-      for (let i = 0; i < numSets; i++) generatedSets.push({ weight: "", reps: String(aiEx.reps || "10"), rpe: "" });
-      newExercises.push({
-        exerciseId: dbMatch.id,
-        name: dbMatch.name,
-        exerciseNote: "",
-        sets: generatedSets,
-        lastSets: await fetchLastFinalSetsForExerciseSafe(dbMatch.id),
-        addedAt: Date.now(),
-        firstEditTime: null,
-        lastEditTime: null,
-      });
-    }
-    activeWorkoutRef = targetWorkoutRef;
-    workoutState.exercises = newExercises;
-    workoutState.templateId = null;
-    workoutState.routineName = "AI Generated Routine";
-    workoutState.focus = [];
-    workoutState.notes = "";
-    if (els.workoutNotesInput) els.workoutNotesInput.value = "";
-    syncFocusUI();
-    await saveWorkoutDraft();
-    els.aiModal?.close();
-    if (els.aiPromptInput) els.aiPromptInput.value = "";
-    clearAiError();
-    setActiveBadge();
-    setAuthUI();
-    renderWorkoutBuilder();
-    await updateResumeDraftButtonState();
-    setStatus("AI routine generated", "info");
+    pendingAiRoutine = {
+      prompt,
+      exercises: payload.exercises,
+      generatedAtMs: Date.now(),
+    };
+    renderAiPreview(payload.exercises);
+    setStatus("AI routine preview ready.", "info");
   } catch (e) {
     console.error("AI Generation Error", e);
     const msg = e?.message || "Failed to generate AI routine.";
@@ -1147,6 +1371,12 @@ els.generateAiBtn?.addEventListener("click", async () => {
     els.generateAiBtn.innerHTML = `Generate Routine`;
     els.generateAiBtn.disabled = false;
   }
+});
+els.applyAiPreviewBtn?.addEventListener("click", () => applyPendingAiRoutine());
+els.discardAiPreviewBtn?.addEventListener("click", () => {
+  clearAiPreview();
+  clearAiError();
+  setStatus("AI routine discarded.", "info");
 });
 
 // ==================== TEMPLATES ====================
@@ -1661,7 +1891,8 @@ async function loadAnalytics() {
       div.className =
         "bg-zinc-800 p-4 rounded-xl flex justify-between items-center border border-zinc-700 cursor-pointer hover:border-emerald-500/50 transition-colors";
       const exerciseCount = Number(w.exerciseCount || (w.exercises || []).length || 0);
-      div.innerHTML = `<div><div class="font-medium text-zinc-200">${displayDate} <span class="text-zinc-500 text-xs ml-1">${timeString}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises</div></div><div class="text-right text-emerald-400 font-bold">${escapeHtml(w.routineName || "Custom Workout")}</div>`;
+      const hasSessionNotes = typeof w.notes === "string" && w.notes.trim().length > 0;
+      div.innerHTML = `<div><div class="font-medium text-zinc-200">${displayDate} <span class="text-zinc-500 text-xs ml-1">${timeString}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises${hasSessionNotes ? ` <span class="ml-2 text-amber-400"><i class="fa-regular fa-note-sticky mr-1"></i>Notes</span>` : ""}</div></div><div class="text-right text-emerald-400 font-bold">${escapeHtml(w.routineName || "Custom Workout")}</div>`;
       div.onclick = () => openWorkoutDetailsFromSummary(w, fullDateStr);
       els.recentWorkouts.appendChild(div);
     });
@@ -1758,9 +1989,12 @@ function showWorkoutDetailsModal(workout, displayDate) {
     currentModalWorkout = workout;
     currentModalDisplayDate = displayDate;
     currentModalWorkoutId = workout.id; els.modalTitle.textContent = `Workout Details`;
-    if (els.deleteWorkoutBtn) els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-box-archive mr-1"></i> Archive Workout`;
     const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
+    const sessionNotes = typeof workout.notes === "string" ? workout.notes.trim() : "";
     let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div>`;
+    if (sessionNotes) {
+        contentHtml += `<div class="mb-6 rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3"><div class="mb-1 text-xs font-bold uppercase tracking-wide text-amber-300"><i class="fa-regular fa-note-sticky mr-2"></i>Session Notes</div><div class="text-sm leading-relaxed text-zinc-200 whitespace-pre-wrap">${escapeHtml(sessionNotes)}</div></div>`;
+    }
     const displayExercises = Array.isArray(workout.exercises) && workout.exercises.length
       ? workout.exercises
       : (workout.exerciseSummaries || []).map((ex) => ({
@@ -1858,26 +2092,6 @@ els.editWorkoutFocusBtn?.addEventListener("click", async () => {
         els.editWorkoutFocusBtn.innerHTML = `<i class="fa-solid fa-bullseye mr-1"></i> Edit Focus`;
     }
 });
-els.deleteWorkoutBtn?.addEventListener("click", async () => {
-    if (!currentModalWorkoutId || !currentUser) return;
-    if (confirm("Archive this workout? It will disappear from active analytics, but it will not be permanently deleted.")) {
-        try {
-          els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> Archiving...`;
-          els.deleteWorkoutBtn.disabled = true;
-          const archiveWorkout = httpsCallable(functions, "archiveWorkout");
-          await archiveWorkout({ workoutId: currentModalWorkoutId });
-          invalidateFinalSetsCache();
-          resetWorkoutAnalyticsCaches();
-          els.workoutModal.close();
-          await runIntegrityCheckIfDue(true);
-          await loadAnalytics();
-          await populateDropdowns();
-          scheduleAnalyticsRefresh();
-          setStatus("Workout archived", "info");
-        } 
-        catch (e) { alert("Failed to archive the workout."); } finally { els.deleteWorkoutBtn.innerHTML = `<i class="fa-solid fa-box-archive mr-1"></i> Archive Workout`; els.deleteWorkoutBtn.disabled = false; }
-    }
-});
 els.closeModalBtn?.addEventListener("click", () => { currentModalWorkout = null; currentModalWorkoutId = null; currentModalDisplayDate = ""; els.workoutModal.close(); });
 
 // ==================== REST TIMER ====================
@@ -1885,23 +2099,111 @@ els.closeModalBtn?.addEventListener("click", () => { currentModalWorkout = null;
 // Persisted so switching apps / locking the screen does not lose the scheduled end time.
 const TIMER_STORAGE_KEY = "k2_rest_timer_state_v2";
 const TIMER_DEFAULT_SECONDS = 120;
+const TimerAudioContextCtor = window.AudioContext || window.webkitAudioContext;
 
 let timerSeconds = TIMER_DEFAULT_SECONDS;
 let timerEndAt = null;
 let isTimerRunning = false;
 let timerInterval = null;
 let alarmSound = null;
+let timerAudioContext = null;
+let timerAudioUnlocked = false;
+
+function ensureAlarmSound() {
+  if (alarmSound) return alarmSound;
+  alarmSound = new Audio("/rest-timer-finished.wav");
+  alarmSound.preload = "auto";
+  alarmSound.playsInline = true;
+  try {
+    alarmSound.load();
+  } catch (_) {
+    // Ignore preload/load errors and fall back later if needed.
+  }
+  return alarmSound;
+}
+
+function ensureTimerAudioContext() {
+  if (!TimerAudioContextCtor) return null;
+  if (!timerAudioContext) {
+    try {
+      timerAudioContext = new TimerAudioContextCtor();
+    } catch (_) {
+      timerAudioContext = null;
+    }
+  }
+  return timerAudioContext;
+}
+
+async function primeTimerAudio() {
+  const sound = ensureAlarmSound();
+  const context = ensureTimerAudioContext();
+  if (context?.state === "suspended") {
+    try {
+      await context.resume();
+    } catch (_) {
+      // Resume can fail until Safari considers the gesture trusted.
+    }
+  }
+
+  try {
+    const wasMuted = sound.muted;
+    const priorVolume = sound.volume;
+    sound.muted = true;
+    sound.volume = 0;
+    const playAttempt = sound.play();
+    if (playAttempt?.then) await playAttempt;
+    sound.pause();
+    sound.currentTime = 0;
+    sound.muted = wasMuted;
+    sound.volume = priorVolume;
+    timerAudioUnlocked = true;
+    return true;
+  } catch (_) {
+    sound.pause();
+    sound.currentTime = 0;
+    if (context?.state === "running") {
+      timerAudioUnlocked = true;
+      return true;
+    }
+    return false;
+  }
+}
+
+function playTimerAlarmFallback() {
+  const context = ensureTimerAudioContext();
+  if (!context || context.state !== "running") return false;
+  const pattern = [0, 0.42, 0.74];
+  const baseTime = context.currentTime + 0.02;
+  pattern.forEach((offset, index) => {
+    const osc = context.createOscillator();
+    const gain = context.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(index === 1 ? 880 : 740, baseTime + offset);
+    gain.gain.setValueAtTime(0.0001, baseTime + offset);
+    gain.gain.exponentialRampToValueAtTime(0.22, baseTime + offset + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, baseTime + offset + 0.24);
+    osc.connect(gain);
+    gain.connect(context.destination);
+    osc.start(baseTime + offset);
+    osc.stop(baseTime + offset + 0.26);
+  });
+  return true;
+}
 
 function playTimerAlarm() {
   try {
-    if (!alarmSound) {
-      alarmSound = new Audio("/rest-timer-finished.wav");
-      alarmSound.preload = "auto";
+    const sound = ensureAlarmSound();
+    sound.currentTime = 0;
+    const playAttempt = sound.play();
+    if (playAttempt?.catch) {
+      playAttempt.catch(() => {
+        if (!playTimerAlarmFallback()) {
+          timerAudioUnlocked = false;
+        }
+      });
     }
-    alarmSound.currentTime = 0;
-    alarmSound.play().catch(() => {});
   } catch (_) {
-    // Never let alarm setup interfere with the rest of app startup/runtime.
+    playTimerAlarmFallback();
   }
 }
 
@@ -2068,19 +2370,39 @@ function restoreTimerFromStorage() {
 restoreTimerFromStorage();
 
 document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") recalcAfterForeground();
+    if (document.visibilityState === "visible") {
+      if (timerAudioContext?.state === "suspended") {
+        timerAudioContext.resume().catch(() => {});
+      }
+      recalcAfterForeground();
+    }
 });
-window.addEventListener("pageshow", () => recalcAfterForeground());
+window.addEventListener("pageshow", () => {
+  if (timerAudioContext?.state === "suspended") {
+    timerAudioContext.resume().catch(() => {});
+  }
+  recalcAfterForeground();
+});
 window.addEventListener("pagehide", () => {
     syncSecondsFromEndTime();
     persistTimerState();
 });
-window.addEventListener("focus", () => recalcAfterForeground());
+window.addEventListener("focus", () => {
+    if (timerAudioContext?.state === "suspended") {
+      timerAudioContext.resume().catch(() => {});
+    }
+    recalcAfterForeground();
+});
 window.addEventListener("blur", () => {
     syncSecondsFromEndTime();
     persistTimerState();
 });
 window.addEventListener("storage", (event) => {
+  if (event.key === APP_THEME_STORAGE_KEY) {
+    applyThemeColor(event.newValue || DEFAULT_APP_THEME_COLOR);
+    updateThemeSettingsUi();
+    return;
+  }
   if (event.key !== TIMER_STORAGE_KEY) return;
   if (!event.newValue) {
     applyTimerStateSnapshot({ running: false, remainingSec: TIMER_DEFAULT_SECONDS, completed: false });
@@ -2094,6 +2416,7 @@ window.addEventListener("storage", (event) => {
 });
 
 els.toggleTimerBtn?.addEventListener("click", () => {
+  primeTimerAudio().catch(() => {});
   els.restTimerWidget?.classList.toggle("hidden");
   if (!els.restTimerWidget?.classList.contains("hidden") && timerSeconds <= 0) {
     timerSeconds = TIMER_DEFAULT_SECONDS;
@@ -2104,6 +2427,7 @@ els.toggleTimerBtn?.addEventListener("click", () => {
   persistTimerState();
 });
 els.timerPlayPauseBtn?.addEventListener("click", () => {
+    primeTimerAudio().catch(() => {});
     if (isTimerRunning) {
         syncSecondsFromEndTime();
         timerEndAt = null;
@@ -2121,6 +2445,7 @@ els.timerPlayPauseBtn?.addEventListener("click", () => {
     }
 });
 els.timerAddBtn?.addEventListener("click", () => {
+    primeTimerAudio().catch(() => {});
     if (isTimerRunning && timerEndAt != null) {
         timerEndAt += 15000;
         syncSecondsFromEndTime();
@@ -2132,6 +2457,7 @@ els.timerAddBtn?.addEventListener("click", () => {
     persistTimerState();
 });
 els.timerStopBtn?.addEventListener("click", () => {
+    primeTimerAudio().catch(() => {});
     clearTimerTick();
     isTimerRunning = false;
     timerEndAt = null;
@@ -2142,6 +2468,7 @@ els.timerStopBtn?.addEventListener("click", () => {
     persistTimerState();
 });
 els.timerCloseBtn?.addEventListener("click", () => {
+  primeTimerAudio().catch(() => {});
   els.restTimerWidget?.classList.add("hidden");
   persistTimerState();
 });
@@ -2242,3 +2569,5 @@ document.querySelectorAll("[data-mobile-nav-link]").forEach((link) => {
     els.mobileMenuBtn?.setAttribute("aria-expanded", "false");
   });
 });
+
+initThemeSettingsPage();

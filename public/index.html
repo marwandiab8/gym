@@ -65,6 +65,9 @@
       <a href="prs.html" class="rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white">
         PRs
       </a>
+      <a href="settings.html" class="rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition hover:bg-white/5 hover:text-white">
+        Settings
+      </a>
     </nav>
 
     <div class="flex items-center gap-2">
@@ -111,6 +114,7 @@
       <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="index.html#recentWorkouts">Workouts</a>
       <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="progress.html">Progress</a>
       <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="prs.html">PRs</a>
+      <a data-mobile-nav-link class="rounded-lg px-3 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/5 hover:text-white" href="settings.html">Settings</a>
     </nav>
   </div>
 
@@ -232,7 +236,6 @@
       <div class="flex gap-4">
         <button id="editWorkoutNameBtn" class="text-emerald-400 hover:text-emerald-300 font-medium text-sm transition-colors"><i class="fa-solid fa-pen mr-1"></i> Edit Routine</button>
         <button id="editWorkoutFocusBtn" class="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors"><i class="fa-solid fa-bullseye mr-1"></i> Edit Focus</button>
-        <button id="deleteWorkoutBtn" class="text-red-500 hover:text-red-400 font-medium text-sm transition-colors"><i class="fa-solid fa-trash mr-1"></i> Delete Workout</button>
         <button id="closeModalBtn" class="text-zinc-500 hover:text-white transition-colors"><i class="fa-solid fa-xmark text-2xl"></i></button>
       </div>
     </div>
@@ -277,9 +280,20 @@
       <div class="text-xs text-zinc-500">
         The AI will generate the workout and try to match the exercises to your database. Any new exercises will be saved automatically.
       </div>
+      <div id="aiPreviewWrap" class="hidden rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
+        <div class="mb-3">
+          <div class="text-sm font-bold uppercase tracking-wide text-indigo-300">Preview</div>
+          <div class="text-xs text-zinc-500">Review the routine before anything is saved to your draft.</div>
+        </div>
+        <div id="aiPreviewList" class="space-y-3 max-h-[260px] overflow-y-auto custom-scrollbar pr-2"></div>
+      </div>
       <button id="generateAiBtn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl transition-colors text-lg shadow-lg shadow-indigo-900/20">Generate Routine</button>
+      <div id="aiPreviewActions" class="hidden grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <button id="discardAiPreviewBtn" class="w-full border border-zinc-700 hover:bg-zinc-800 text-zinc-200 font-bold py-3 rounded-xl transition-colors">Discard</button>
+        <button id="applyAiPreviewBtn" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl transition-colors">Use Routine</button>
+      </div>
     </div>
   </dialog>
-  <script type="module" src="app.js?v=20260421-3m"></script>
+  <script type="module" src="app.js?v=20260514-theme1"></script>
 </body>
 </html>
