@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer, startAfter } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
 import {
   pickBestSetForPR,
@@ -1808,6 +1808,34 @@ function compareWorkoutsByDateDesc(a, b) {
   return (Number(b?.updatedAtMs) || 0) - (Number(a?.updatedAtMs) || 0);
 }
 
+function workoutFallsWithinDateWindow(workout, minDateStr) {
+  const { dDate } = workoutDisplayMeta(workout || {});
+  return typeof dDate === "string" && dDate >= minDateStr;
+}
+
+async function fetchDateWindowRows(baseConstraintsFactory, minDateStr, pageSize = 120, maxPages = 6) {
+  const rows = [];
+  let cursor = null;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const constraints = [...baseConstraintsFactory(minDateStr)];
+    if (cursor) constraints.push(startAfter(cursor));
+    constraints.push(limit(pageSize));
+
+    const snap = await getDocs(query(...constraints));
+    if (snap.empty) break;
+
+    snap.docs.forEach((d) => {
+      rows.push({ id: d.id, ...d.data() });
+    });
+
+    cursor = snap.docs[snap.docs.length - 1] || null;
+    if (snap.docs.length < pageSize) break;
+  }
+
+  return rows;
+}
+
 async function loadAnalytics() {
   if (!currentUser || !els.analyticsContent || !els.recentWorkouts) return;
   try {
@@ -1835,22 +1863,31 @@ async function loadAnalytics() {
 
     let summaryWindowRows = [];
     try {
-      const snapWindow = await getDocs(query(summariesCol, where("date", ">=", minDateStr), limit(180)));
-      summaryWindowRows = snapWindow.docs.map((d) => ({ id: d.id, ...d.data() }));
+      summaryWindowRows = await fetchDateWindowRows(
+        (windowMinDateStr) => [
+          summariesCol,
+          where("date", ">=", windowMinDateStr),
+          orderBy("date", "desc"),
+        ],
+        minDateStr
+      );
     } catch (e) {
       console.warn("Analytics summary date-window query failed", e);
     }
     let rawWindowRows = [];
     try {
-      const rawWindow = await getDocs(
-        query(workoutsCol, where("status", "==", "final"), where("date", ">=", minDateStr), limit(180))
+      rawWindowRows = await fetchDateWindowRows(
+        (windowMinDateStr) => [
+          workoutsCol,
+          where("status", "==", "final"),
+          where("date", ">=", windowMinDateStr),
+          orderBy("date", "desc"),
+        ],
+        minDateStr
       );
-      rawWindowRows = rawWindow.docs.map((d) => ({ id: d.id, ...d.data() }));
     } catch (e) {
       console.warn("Analytics raw date-window query failed", e);
     }
-    analyticsWindowWorkouts = mergeWorkoutLikeRecords(summaryWindowRows, rawWindowRows);
-
     let recentSummaryRows = [];
     try {
       const snapRecent = await getDocs(
@@ -1870,7 +1907,11 @@ async function loadAnalytics() {
       recentRawRows = [];
     }
     const mergedRecentRows = mergeWorkoutLikeRecords(recentSummaryRows, recentRawRows);
-    let recentList = (analyticsWindowWorkouts.length ? [...analyticsWindowWorkouts] : mergedRecentRows)
+    const recentWindowRows = mergedRecentRows.filter((w) => workoutFallsWithinDateWindow(w, minDateStr));
+    analyticsWindowWorkouts = mergeWorkoutLikeRecords(summaryWindowRows, rawWindowRows, recentWindowRows)
+      .filter((w) => workoutFallsWithinDateWindow(w, minDateStr));
+
+    let recentList = mergeWorkoutLikeRecords(analyticsWindowWorkouts, mergedRecentRows)
       .sort(compareWorkoutsByDateDesc)
       .slice(0, 8);
     if (recentList.length === 0) recentList = [...mergedRecentRows].sort(compareWorkoutsByDateDesc).slice(0, 8);
