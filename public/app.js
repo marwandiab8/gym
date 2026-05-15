@@ -1708,10 +1708,10 @@ function scheduleAnalyticsRefresh(delayMs = 1500) {
 const HEAT_FOCUS_ORDER = ["Legs", "Chest", "Shoulders", "Back"];
 /** Tailwind-equivalent single-cell classes (1 category only). */
 const HEAT_SINGLE_CLASS = {
-  Legs: "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]",
-  Chest: "bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]",
-  Shoulders: "bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)]",
-  Back: "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]",
+  Legs: "heat-legs-fill shadow-[0_0_8px_rgba(59,130,246,0.5)]",
+  Chest: "heat-chest-fill shadow-[0_0_8px_rgba(249,115,22,0.5)]",
+  Shoulders: "heat-shoulders-fill shadow-[0_0_8px_rgba(168,85,247,0.5)]",
+  Back: "heat-back-cell",
   _none: "bg-zinc-400 shadow-[0_0_8px_rgba(161,161,170,0.5)]",
 };
 /** Hex for multi-segment CSS gradients (same hues as legend). */
@@ -1965,10 +1965,10 @@ async function loadAnalytics() {
               <div class="text-sm font-medium text-zinc-300">90-Day Workout Focus</div>
               ${heatHtml}
               <div class="text-xs text-zinc-500 flex justify-center gap-4 flex-wrap">
-                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm bg-blue-500"></div> Legs</span>
-                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm bg-orange-500"></div> Chest</span>
-                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm bg-purple-500"></div> Shoulders</span>
-                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm bg-emerald-500"></div> Back</span>
+                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm heat-legs-fill"></div> Legs</span>
+                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm heat-chest-fill"></div> Chest</span>
+                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm heat-shoulders-fill"></div> Shoulders</span>
+                  <span class="flex items-center gap-1"><div class="w-2 h-2 rounded-sm heat-back-fill"></div> Back</span>
               </div>
               <div id="newHeatSelectedDateDisplay" class="mt-4 text-sm hidden px-4 py-2 bg-zinc-800/80 rounded-lg border border-zinc-700"></div>
           </div>

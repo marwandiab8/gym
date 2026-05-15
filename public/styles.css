@@ -96,3 +96,40 @@ input[type=number] {
     border-color: var(--app-accent-soft-border) !important;
     background-color: var(--app-accent-soft-bg) !important;
 }
+
+.focus-legs-accent {
+    accent-color: #3b82f6 !important;
+}
+
+.focus-chest-accent {
+    accent-color: #f97316 !important;
+}
+
+.focus-shoulders-accent {
+    accent-color: #a855f7 !important;
+}
+
+.focus-back-accent {
+    accent-color: #10b981 !important;
+}
+
+.heat-legs-fill {
+    background-color: #3b82f6 !important;
+}
+
+.heat-chest-fill {
+    background-color: #f97316 !important;
+}
+
+.heat-shoulders-fill {
+    background-color: #a855f7 !important;
+}
+
+.heat-back-fill {
+    background-color: #10b981 !important;
+}
+
+.heat-back-cell {
+    background-color: #10b981 !important;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.5) !important;
+}
