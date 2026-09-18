@@ -19,8 +19,8 @@
   - Derived by `onWorkoutFinalize`.
   - Used to prefill "Copy Last".
 - `users/{uid}/prs`
-  - Written by the client when finishing a workout.
-  - Not currently recomputed by backend triggers.
+  - Written by `finalizeWorkout` inside the finalize transaction (and re-dated by `correctFinalizedWorkoutDate`).
+  - The client can read and delete PRs but not create or update them (see `firestore.rules`).
 - `users/{uid}/templates`
   - Saved workout templates.
 - `users/{uid}/custom_exercises`
@@ -36,7 +36,7 @@
 
 ## Known Sharp Edges
 
-- PR state is updated on workout completion in the client, not by a trigger.
+- PRs are computed in `finalizeWorkout`; a PR sync failure is recorded on the workout receipt but does not block saving.
 - Analytics and recent-workout display use helper logic in `workoutDisplayMeta()`, so date semantics are easy to regress.
 - `exercise_last_sets` is based on a capped scan of recent final workouts in the function trigger.
 - `public/app.js` is monolithic; changes in one area often affect autosave, analytics, and modal rendering.

@@ -244,3 +244,19 @@ test("a brand-new exercise (no history, no cached last sets) does not crash the 
   assert.doesNotMatch(fetchProgress, /lastData\?\.sourceWorkoutId === latestSession\?\.workoutId/);
   assert.match(fetchProgress, /lastData && latestSession && lastData\.sourceWorkoutId === latestSession\.workoutId/);
 });
+
+test("PRs are written only by Functions: no client PR writer or client PR write rule remains", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  const rules = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf8");
+
+  assert.doesNotMatch(appSource, /updatePRsAfterWorkout/);
+  assert.doesNotMatch(appSource, /pickBestSetForPR/, "unused import must not come back");
+  // the app may still read and delete PRs, but must not write them
+  assert.doesNotMatch(appSource, /(setDoc|updateDoc|addDoc)\(\s*(prRef|doc\(db, "users", currentUser\.uid, "prs")/);
+
+  const prsRules = rules.match(/match \/prs\/\{prId\} \{[\s\S]*?\n      \}/)[0];
+  assert.match(prsRules, /allow read: if isOwner\(userId\)/);
+  assert.match(prsRules, /allow delete: if isOwner\(userId\)/);
+  assert.doesNotMatch(prsRules, /allow (create|update|write)/);
+  assert.doesNotMatch(rules, /validPr|isWeight/, "helpers for the removed PR client rule must go with it");
+});

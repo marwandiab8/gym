@@ -3,7 +3,6 @@ import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRe
 import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
 import {
-  pickBestSetForPR,
   completedExerciseSetRows,
   filterScorableSets,
   isCompletedSet,
@@ -2329,34 +2328,6 @@ function renderWorkoutBuilder() {
 }
 
 // ==================== PRS, ANALYTICS & CHARTS ====================
-async function updatePRsAfterWorkout(completedExercises) {
-  await Promise.all(completedExercises.map(async (ex) => {
-    if (!ex.sets.length) return;
-
-    const validSets = filterScorableSets(ex.sets);
-    if (!validSets.length) return;
-
-    const best = pickBestSetForPR(validSets);
-    if (!best) return;
-
-    const prRef = doc(db, "users", currentUser.uid, "prs", ex.exerciseId);
-    const prSnap = await getDoc(prRef);
-    const current = prSnap.exists() ? prSnap.data() : { weight: 0, reps: 0 };
-
-    if (isNewPRBeatsCurrent(best, current)) {
-      await setDoc(prRef, {
-        exerciseId: ex.exerciseId,
-        exerciseName: ex.name,
-        weight: best.weight,
-        reps: best.reps,
-        unit: els.unitSelect?.value || "lb",
-        date: selectedWorkoutDate(),
-        timestamp: serverTimestamp(),
-      });
-    }
-  }));
-}
-
 let unsubPRs = null;
 function listenToPRs() {
   if (unsubPRs) {

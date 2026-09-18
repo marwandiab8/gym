@@ -25,7 +25,7 @@ Read [references/architecture.md](references/architecture.md) before changing da
 2. Preserve these invariants:
    - Final workouts are the source of truth.
    - `workout_summaries` and `exercise_last_sets` are derived data, written only by Functions.
-   - PRs are client-maintained documents in `users/{uid}/prs`.
+   - PRs in `users/{uid}/prs` are written only by Functions (`finalizeWorkout`, date repair); the client can only read and delete them.
    - Shared scoring logic must stay in sync across client and Functions.
 3. When changing Firestore query shape, check whether a composite index is required and update `firestore.indexes.json`.
 4. When changing any summary, last-set, PR, or analytics behavior, test both:

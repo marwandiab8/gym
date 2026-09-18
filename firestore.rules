@@ -25,10 +25,6 @@ service cloud.firestore {
       return value is list && value.size() <= maxItems;
     }
 
-    function isWeight(value) {
-      return value is int || value is float;
-    }
-
     function validUnit(unit) {
       return unit == "lb" || unit == "kg";
     }
@@ -85,24 +81,6 @@ service cloud.firestore {
       isOptionalString(data.archivedByUid, 120);
     }
 
-    function validPr(data) {
-      return data.keys().hasOnly([
-        "exerciseId",
-        "exerciseName",
-        "weight",
-        "reps",
-        "unit",
-        "date",
-        "timestamp"
-      ]) &&
-      isNonEmptyString(data.exerciseId, 120) &&
-      isNonEmptyString(data.exerciseName, 120) &&
-      isWeight(data.weight) &&
-      data.reps is int &&
-      validUnit(data.unit) &&
-      isNonEmptyString(data.date, 20);
-    }
-
     function validTemplate(data) {
       return data.keys().hasOnly(["name", "exercises", "createdAt"]) &&
         isNonEmptyString(data.name, 80) &&
@@ -134,8 +112,8 @@ service cloud.firestore {
       }
 
       match /prs/{prId} {
+        // PRs are written only by Functions (finalizeWorkout, date repair). The app can read and delete them.
         allow read: if isOwner(userId);
-        allow create, update: if isOwner(userId) && validPr(request.resource.data);
         allow delete: if isOwner(userId);
       }
 
