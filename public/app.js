@@ -23,6 +23,7 @@ import {
   normalizeCachedExerciseSessions,
   previousSetPlaceholder,
   progressStateMessage,
+  resolveExerciseSessions,
   resolveNewWorkoutDate,
   selectEmptyStaleDraftIds,
   selectPreviousExerciseSessions,
@@ -88,6 +89,8 @@ let currentRoute = "home";
 let isFinishingWorkout = false;
 let isDiscardingWorkout = false;
 const exerciseProgressCache = new Map();
+// Shared newest-first pages of finalized workouts used to build per-exercise history (see loadFinalHistoryPage).
+let finalHistoryPages = { uid: null, pages: [] };
 const exerciseProgressLoadsStarted = new WeakSet();
 
 function routeFromHash() {
@@ -1672,6 +1675,7 @@ function hydrateExerciseProgressReference(exercise) {
 }
 
 function invalidateFinalSetsCache(exerciseIds = []) {
+  finalHistoryPages = { uid: null, pages: [] };
   chartWorkoutsSample = [];
   chartWorkoutsLoadPromise = null;
   exerciseProgressCache.clear();
@@ -1818,27 +1822,53 @@ function updateExerciseProgressPanel(exercise) {
   exercise.sets.forEach((_set, index) => updateSetComparisonRow(card, exercise, index));
 }
 
+// Newest finalized workouts, read once per session and shared by every exercise card. Each card used to page
+// through the whole history on its own, so a 6-exercise workout re-read the same documents six times over.
+const FINAL_HISTORY_PAGE_SIZE = 50;
+const FINAL_HISTORY_MAX_PAGES = 4;
+
+function loadFinalHistoryPage(index) {
+  const uid = currentUser.uid;
+  if (finalHistoryPages.uid !== uid) finalHistoryPages = { uid, pages: [] };
+  const state = finalHistoryPages;
+  if (!state.pages[index]) {
+    const load = (async () => {
+      const previous = index > 0 ? await loadFinalHistoryPage(index - 1) : null;
+      if (previous && !previous.hasMore) return { workouts: [], cursor: null, hasMore: false };
+      const constraints = [
+        where("status", "==", "final"),
+        orderBy("updatedAtMs", "desc"),
+        limit(FINAL_HISTORY_PAGE_SIZE),
+      ];
+      if (previous) constraints.push(startAfter(previous.cursor));
+      const snap = await getDocs(query(collection(db, "users", uid, "workouts"), ...constraints));
+      return {
+        workouts: snap.docs.map((workoutSnap) => ({ id: workoutSnap.id, ...workoutSnap.data() })),
+        cursor: snap.docs[snap.docs.length - 1] || null,
+        hasMore: snap.size === FINAL_HISTORY_PAGE_SIZE,
+      };
+    })();
+    state.pages[index] = load;
+    // A failed read must not be cached, or every later card would fail the same way until reload.
+    load.catch(() => { if (state.pages[index] === load) delete state.pages[index]; });
+  }
+  return state.pages[index];
+}
+
 async function fetchExerciseProgress(exerciseId) {
   const cacheKey = `${currentUser?.uid || "signed-out"}:${exerciseId}`;
   if (exerciseProgressCache.has(cacheKey)) return exerciseProgressCache.get(cacheKey);
   const request = (async () => {
     const localProgress = readLocalExerciseProgress(exerciseId);
+    // Stops after FINAL_HISTORY_MAX_PAGES pages: an exercise you have never logged would otherwise read every
+    // workout you have ever saved. `complete` is false when the cap cut the scan short.
     const fetchFinalizedSessions = async () => {
       const workouts = [];
-      let cursor = null;
-      while (true) {
-        const constraints = [
-          where("status", "==", "final"),
-          orderBy("updatedAtMs", "desc"),
-          limit(50),
-        ];
-        if (cursor) constraints.push(startAfter(cursor));
-        const snap = await getDocs(query(
-          collection(db, "users", currentUser.uid, "workouts"),
-          ...constraints
-        ));
-        workouts.push(...snap.docs.map((workoutSnap) => ({ id: workoutSnap.id, ...workoutSnap.data() })));
-        const sessions = selectPreviousExerciseSessions(
+      let sessions = [];
+      for (let index = 0; index < FINAL_HISTORY_MAX_PAGES; index++) {
+        const page = await loadFinalHistoryPage(index);
+        workouts.push(...page.workouts);
+        sessions = selectPreviousExerciseSessions(
           workouts,
           exerciseId,
           activeWorkoutRef?.id || null,
@@ -1846,9 +1876,9 @@ async function fetchExerciseProgress(exerciseId) {
           isCompletedSet,
           completedExerciseSetRows
         );
-        if (sessions.length >= 5 || snap.size < 50) return sessions;
-        cursor = snap.docs[snap.docs.length - 1];
+        if (sessions.length >= 5 || !page.hasMore) return { sessions, complete: true };
       }
+      return { sessions, complete: false };
     };
     const [historyResult, lastSetsResult, prResult] = await Promise.allSettled([
       fetchFinalizedSessions(),
@@ -1872,19 +1902,20 @@ async function fetchExerciseProgress(exerciseId) {
       }], 1, isCompletedSet)
       : [];
     const historyUnavailable = historyResult.status === "rejected" || navigator.onLine === false;
-    const sessions = historyUnavailable
-      ? normalizeCachedExerciseSessions([
-        ...(historyResult.status === "fulfilled" ? historyResult.value : []),
-        ...derivedSessions,
-        ...(localProgress?.sessions || []),
-      ], 5, isCompletedSet)
-      : historyResult.value;
+    const sessions = resolveExerciseSessions({
+      history: historyResult.status === "fulfilled" ? historyResult.value : null,
+      derivedSessions,
+      cachedSessions: localProgress?.sessions || [],
+      historyUnavailable,
+      limit: 5,
+      isCompletedSet,
+    });
     const latestSession = sessions[0] || null;
     const pr = prResult.status === "fulfilled" && prResult.value.exists()
       ? prResult.value.data()
       : localProgress?.pr || null;
     const exerciseNote = latestSession?.exerciseNote || (
-      lastData?.sourceWorkoutId === latestSession?.workoutId ? String(lastData.exerciseNote || "").slice(0, 500) : ""
+      lastData && latestSession && lastData.sourceWorkoutId === latestSession.workoutId ? String(lastData.exerciseNote || "").slice(0, 500) : ""
     ) || String(localProgress?.exerciseNote || "").slice(0, 500);
     const progress = {
       status: historyUnavailable ? (navigator.onLine === false ? "offline" : "error") : "ready",

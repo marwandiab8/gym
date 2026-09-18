@@ -231,3 +231,24 @@ export function selectEmptyStaleDraftIds(drafts, { activeId = null, nowMs = Date
     ))
     .map((draft) => draft.id);
 }
+
+/**
+ * Chooses the previous sessions to show for an exercise.
+ * `history` is { sessions, complete } from the finalized-workout scan; `complete` is false when the scan stopped
+ * at its page cap, in which case older sessions are unknown and the derived last-sets cache fills the gap.
+ */
+export function resolveExerciseSessions({
+  history = null,
+  derivedSessions = [],
+  cachedSessions = [],
+  historyUnavailable = false,
+  limit = 5,
+  isCompletedSet = defaultIsCompletedSet,
+} = {}) {
+  const sessions = Array.isArray(history?.sessions) ? history.sessions : [];
+  if (historyUnavailable) {
+    return normalizeCachedExerciseSessions([...sessions, ...derivedSessions, ...cachedSessions], limit, isCompletedSet);
+  }
+  if (history?.complete || sessions.length >= limit) return sessions;
+  return normalizeCachedExerciseSessions([...sessions, ...derivedSessions], limit, isCompletedSet);
+}

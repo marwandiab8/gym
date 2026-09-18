@@ -192,3 +192,55 @@ test("draft cleanup is wired: one draft at a time, in-app discard, safe discard 
   assert.match(appSource, /Permanently delete the unfinished workout/);
   assert.match(appSource, /if \(next\.best\) showDraftRecoveryDialog\(next\.best, next\.count\)/);
 });
+
+test("exercise history uses the derived last session when the capped scan could not reach it", async () => {
+  const { resolveExerciseSessions } = await loadClientModule("../../public/js/workoutSession.js");
+  const session = (workoutId, updatedAtMs) => ({
+    workoutId, date: "2026-01-01", updatedAtMs, unit: "lb", exerciseNote: "", sets: [{ weight: "100", reps: "5", rpe: "" }],
+  });
+  const derived = [session("old-workout", 1)];
+
+  // scan finished and found nothing: a genuinely new exercise, nothing to invent
+  assert.deepEqual(resolveExerciseSessions({ history: { sessions: [], complete: true }, derivedSessions: derived }), []);
+  // scan hit its page cap before finding anything: fall back to the derived last session
+  assert.deepEqual(
+    resolveExerciseSessions({ history: { sessions: [], complete: false }, derivedSessions: derived }).map((s) => s.workoutId),
+    ["old-workout"]
+  );
+  // capped scan that already found the same session does not duplicate it
+  assert.deepEqual(
+    resolveExerciseSessions({ history: { sessions: [session("old-workout", 1)], complete: false }, derivedSessions: derived }).map((s) => s.workoutId),
+    ["old-workout"]
+  );
+  // a full set of sessions is returned untouched
+  const five = [5, 4, 3, 2, 1].map((n) => session(`w${n}`, n));
+  assert.equal(resolveExerciseSessions({ history: { sessions: five, complete: false }, derivedSessions: derived }).length, 5);
+  // offline/error still merges everything, including the on-device cache
+  assert.deepEqual(
+    resolveExerciseSessions({ history: null, derivedSessions: derived, cachedSessions: [session("cached", 2)], historyUnavailable: true }).map((s) => s.workoutId),
+    ["cached", "old-workout"]
+  );
+});
+
+test("exercise history scan is capped and shared between exercise cards", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  assert.match(appSource, /const FINAL_HISTORY_MAX_PAGES = \d+;/);
+  const fetchProgress = appSource.match(/async function fetchExerciseProgress\([\s\S]*?\n\}/)[0];
+  assert.match(fetchProgress, /for \(let index = 0; index < FINAL_HISTORY_MAX_PAGES; index\+\+\)/);
+  assert.match(fetchProgress, /loadFinalHistoryPage\(index\)/);
+  assert.doesNotMatch(fetchProgress, /while \(true\)/, "the history scan must not be unbounded");
+  assert.doesNotMatch(fetchProgress, /getDocs\(query\(\s*collection\(db, "users", currentUser\.uid, "workouts"\)/, "cards must share pages, not query on their own");
+  // finishing a workout must drop the shared pages so the new workout shows up as history
+  const invalidate = appSource.match(/function invalidateFinalSetsCache\([\s\S]*?\n\}/)[0];
+  assert.match(invalidate, /finalHistoryPages = \{ uid: null, pages: \[\] \}/);
+  // a failed page read must not be cached
+  assert.match(appSource, /delete state\.pages\[index\]/);
+});
+
+test("a brand-new exercise (no history, no cached last sets) does not crash the progress load", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  const fetchProgress = appSource.match(/async function fetchExerciseProgress\([\s\S]*?\n\}/)[0];
+  // `lastData?.x === latestSession?.y` is true when both are null/undefined, then `lastData.exerciseNote` throws
+  assert.doesNotMatch(fetchProgress, /lastData\?\.sourceWorkoutId === latestSession\?\.workoutId/);
+  assert.match(fetchProgress, /lastData && latestSession && lastData\.sourceWorkoutId === latestSession\.workoutId/);
+});
