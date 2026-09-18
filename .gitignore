@@ -1,2 +1,7 @@
 # Local secrets — never commit
 functions/api.key
+functions/.env*
+.claude/settings.local.json
+
+# Dependencies (installed by npm, never commit)
+node_modules/
