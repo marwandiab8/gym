@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, writeBatch, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
 import {
   completedExerciseSetRows,
@@ -13,11 +13,14 @@ import {
 } from "./js/setScoring.js";
 import {
   applyDraftDateChoice,
+  buildDateCorrectionRequest,
   compareSetPerformance,
   countLoggedSets,
   draftHasMeaningfulProgress,
   formatCalendarDate,
   localCalendarDateKey,
+  moveListItem,
+  moveRoutine,
   needsWorkoutDateConfirmation,
   normalizeCachedExerciseSessions,
   previousSetPlaceholder,
@@ -25,6 +28,7 @@ import {
   resolveExerciseSessions,
   resolveNewWorkoutDate,
   selectEmptyStaleDraftIds,
+  sortRoutines,
   selectPreviousExerciseSessions,
 } from "./js/workoutSession.js";
 
@@ -61,6 +65,8 @@ const els = {
   draftRecoveryDialog: document.getElementById("draftRecoveryDialog"), draftRecoveryText: document.getElementById("draftRecoveryText"), draftRecoveryResume: document.getElementById("draftRecoveryResume"), draftRecoveryDiscard: document.getElementById("draftRecoveryDiscard"),
   workoutDateDialog: document.getElementById("workoutDateDialog"), workoutDateDialogTitle: document.getElementById("workoutDateDialogTitle"), workoutDateDialogText: document.getElementById("workoutDateDialogText"), workoutDateMoveBtn: document.getElementById("workoutDateMoveBtn"), workoutDateKeepBtn: document.getElementById("workoutDateKeepBtn"), workoutDateCancelBtn: document.getElementById("workoutDateCancelBtn"),
   editWorkoutNameBtn: document.getElementById("editWorkoutNameBtn"),
+  editWorkoutDateBtn: document.getElementById("editWorkoutDateBtn"),
+  removeWorkoutBtn: document.getElementById("removeWorkoutBtn"),
   editWorkoutFocusBtn: document.getElementById("editWorkoutFocusBtn"),
   themeColorInput: document.getElementById("themeColorInput"),
   themeColorValue: document.getElementById("themeColorValue"),
@@ -82,6 +88,8 @@ const INTEGRITY_CHECK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const INTEGRITY_CHECK_KEY_PREFIX = "k2_integrity_check_v1:";
 const APP_THEME_STORAGE_KEY = "k2_app_theme_v1";
 const DEFAULT_APP_THEME_COLOR = "#34d399";
+// Small chevron buttons used to reorder routines and exercises.
+const MOVE_BTN_CLASS = "w-8 h-7 rounded-md border border-zinc-600 text-zinc-300 hover:bg-zinc-700 flex items-center justify-center text-xs transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent";
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
 let currentRoute = "home";
@@ -1079,6 +1087,18 @@ function normalizeWorkoutExercisesArray(arr) {
     exerciseNote: ex.exerciseNote != null ? String(ex.exerciseNote) : "",
     lastSets: (Array.isArray(ex.lastSets) ? ex.lastSets : []).filter(isCompletedSet),
   }));
+}
+
+// After a deploy a new service worker takes over. Reload onto the new version, but never in the middle of a workout:
+// the page then keeps running and the new version loads the next time the app is opened.
+if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloadingForUpdate = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloadingForUpdate || activeWorkoutRef || isFinishingWorkout || isDiscardingWorkout) return;
+    reloadingForUpdate = true;
+    window.location.reload();
+  });
 }
 
 window.addEventListener("beforeunload", () => {
@@ -2133,22 +2153,56 @@ els.discardAiPreviewBtn?.addEventListener("click", () => {
 
 // ==================== TEMPLATES ====================
 let currentEditTemplateId = null; let currentEditTemplateExercises = [];
+let loadedTemplates = [];
+
+function renderTemplatesList() {
+    if (!els.templatesList) return;
+    els.templatesList.innerHTML = "";
+    if (!loadedTemplates.length) { els.templatesList.innerHTML = `<div class="text-zinc-500 text-sm">No routines saved yet.</div>`; return; }
+    loadedTemplates.forEach((template, position) => {
+        const div = document.createElement("div"); div.className = "bg-zinc-800 p-4 rounded-xl border border-zinc-700 flex justify-between items-center hover:border-indigo-500/50 transition-colors group";
+        div.innerHTML = `<div class="flex flex-col gap-1 pr-3"><button type="button" class="moveTemplateUp ${MOVE_BTN_CLASS}" title="Move up" aria-label="Move ${escapeHtml(template.name)} up"${position === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="moveTemplateDown ${MOVE_BTN_CLASS}" title="Move down" aria-label="Move ${escapeHtml(template.name)} down"${position === loadedTemplates.length - 1 ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button></div><div class="flex-1 pr-4 min-w-0"><div class="font-bold text-zinc-100 group-hover:text-indigo-400 transition-colors">${escapeHtml(template.name)}</div><div class="text-xs text-zinc-400 mt-1">${(template.exercises || []).map(e => e.name).join(", ").substring(0, 40)}...</div></div><div class="flex items-center gap-2"><button class="editTemplateBtn text-zinc-400 hover:text-white px-3 py-2 rounded-lg bg-zinc-700/50 hover:bg-zinc-700 transition-colors border border-zinc-700"><i class="fa-solid fa-pen"></i></button><button class="startTemplateBtn bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-indigo-900/20 transition-colors">Start</button></div>`;
+        div.querySelector(".startTemplateBtn").onclick = () => startWorkoutFromTemplate(template.id, template);
+        div.querySelector(".editTemplateBtn").onclick = () => openTemplateEditModal(template.id, template);
+        div.querySelector(".moveTemplateUp").onclick = () => moveTemplate(template.id, -1);
+        div.querySelector(".moveTemplateDown").onclick = () => moveTemplate(template.id, 1);
+        els.templatesList.appendChild(div);
+    });
+}
+
 async function loadTemplates() {
     if (!currentUser || !els.templatesList) return;
     try {
         const q = query(collection(db, "users", currentUser.uid, "templates"), limit(100));
         const snap = await getDocs(q);
-        els.templatesList.innerHTML = "";
-        if(snap.empty) { els.templatesList.innerHTML = `<div class="text-zinc-500 text-sm">No routines saved yet.</div>`; return; }
-        snap.forEach(d => {
-            const template = d.data(); const div = document.createElement("div"); div.className = "bg-zinc-800 p-4 rounded-xl border border-zinc-700 flex justify-between items-center hover:border-indigo-500/50 transition-colors group";
-            div.innerHTML = `<div class="flex-1 pr-4"><div class="font-bold text-zinc-100 group-hover:text-indigo-400 transition-colors">${escapeHtml(template.name)}</div><div class="text-xs text-zinc-400 mt-1">${(template.exercises || []).map(e => e.name).join(", ").substring(0, 40)}...</div></div><div class="flex items-center gap-2"><button class="editTemplateBtn text-zinc-400 hover:text-white px-3 py-2 rounded-lg bg-zinc-700/50 hover:bg-zinc-700 transition-colors border border-zinc-700"><i class="fa-solid fa-pen"></i></button><button class="startTemplateBtn bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-indigo-900/20 transition-colors">Start</button></div>`;
-            div.querySelector(".startTemplateBtn").onclick = () => startWorkoutFromTemplate(d.id, template); div.querySelector(".editTemplateBtn").onclick = () => openTemplateEditModal(d.id, template);
-            els.templatesList.appendChild(div);
-        });
+        loadedTemplates = sortRoutines(snap.docs.map((d) => {
+            const data = d.data();
+            return { ...data, id: d.id, createdAtMs: typeof data.createdAt?.toMillis === "function" ? data.createdAt.toMillis() : 0 };
+        }));
+        renderTemplatesList();
     } catch (e) {
         console.error("Failed to load routines", e);
         els.templatesList.innerHTML = `<div class="text-red-400 rounded-xl border border-red-500/20 bg-red-500/5 py-6 px-4 text-center text-sm">Could not load routines.</div>`;
+    }
+}
+
+/** Reorders the routines list and saves the new order so it is the same next time. */
+async function moveTemplate(id, delta) {
+    if (!currentUser) return;
+    const { routines, updates } = moveRoutine(loadedTemplates, id, delta);
+    if (!updates.length) return;
+    const previous = loadedTemplates;
+    loadedTemplates = routines;
+    renderTemplatesList();
+    try {
+        const batch = writeBatch(db);
+        updates.forEach(({ id: templateId, order }) => batch.update(doc(db, "users", currentUser.uid, "templates", templateId), { order }));
+        await batch.commit();
+    } catch (e) {
+        console.error("Failed to save routine order", e);
+        loadedTemplates = previous;
+        renderTemplatesList();
+        setStatus("Could not save the new routine order.", "error");
     }
 }
 
@@ -2157,8 +2211,11 @@ function renderEditTemplateExercises() {
     els.editTemplateExercises.innerHTML = ""; if (currentEditTemplateExercises.length === 0) { els.editTemplateExercises.innerHTML = `<div class="text-zinc-500 text-sm">No exercises.</div>`; return; }
     currentEditTemplateExercises.forEach((ex, idx) => {
         const div = document.createElement("div"); div.className = "flex justify-between items-center bg-zinc-800 border border-zinc-700 p-3 rounded-lg";
-        div.innerHTML = `<span class="text-sm font-medium text-zinc-200">${escapeHtml(ex.name)}</span><button class="text-red-400 hover:text-red-300 px-3 py-1 bg-red-400/10 rounded border border-red-400/20"><i class="fa-solid fa-minus"></i></button>`;
-        div.querySelector("button").onclick = () => { currentEditTemplateExercises.splice(idx, 1); renderEditTemplateExercises(); }; els.editTemplateExercises.appendChild(div);
+        const last = currentEditTemplateExercises.length - 1;
+        div.innerHTML = `<span class="text-sm font-medium text-zinc-200 flex-1 min-w-0 truncate">${escapeHtml(ex.name)}</span><div class="flex items-center gap-2"><button type="button" class="ex-move-up ${MOVE_BTN_CLASS}" title="Move up" aria-label="Move ${escapeHtml(ex.name)} up"${idx === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="ex-move-down ${MOVE_BTN_CLASS}" title="Move down" aria-label="Move ${escapeHtml(ex.name)} down"${idx === last ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button><button type="button" class="ex-remove text-red-400 hover:text-red-300 px-3 py-1 bg-red-400/10 rounded border border-red-400/20" title="Remove"><i class="fa-solid fa-minus"></i></button></div>`;
+        div.querySelector(".ex-move-up").onclick = () => { currentEditTemplateExercises = moveListItem(currentEditTemplateExercises, idx, -1); renderEditTemplateExercises(); };
+        div.querySelector(".ex-move-down").onclick = () => { currentEditTemplateExercises = moveListItem(currentEditTemplateExercises, idx, 1); renderEditTemplateExercises(); };
+        div.querySelector(".ex-remove").onclick = () => { currentEditTemplateExercises.splice(idx, 1); renderEditTemplateExercises(); }; els.editTemplateExercises.appendChild(div);
     });
 }
 els.saveTemplateChangesBtn?.addEventListener("click", async () => {
@@ -2293,11 +2350,15 @@ function renderWorkoutBuilder() {
     const favOn = isExerciseFavorite(ex.exerciseId);
     card.innerHTML = `<div class="flex justify-between items-start gap-2 mb-2">
       <div class="font-bold text-xl text-emerald-400 flex-1 min-w-0">${escapeHtml(ex.name)}</div>
+      <div class="flex flex-col gap-1 shrink-0"><button type="button" class="ex-move-up ${MOVE_BTN_CLASS}" title="Move exercise up" aria-label="Move ${escapeHtml(ex.name)} up"${exIndex === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="ex-move-down ${MOVE_BTN_CLASS}" title="Move exercise down" aria-label="Move ${escapeHtml(ex.name)} down"${exIndex === workoutState.exercises.length - 1 ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button></div>
       <button type="button" class="ex-fav-toggle shrink-0 w-10 h-10 rounded-lg border border-zinc-600 hover:bg-zinc-800 text-amber-400 flex items-center justify-center" title="${favOn ? "Remove from favorites" : "Add to favorites"}" aria-label="Favorite"><i class="fa-star ${favOn ? "fa-solid" : "fa-regular"}"></i></button>
     </div>
     <label class="block text-xs text-zinc-500 mb-1">Notes</label>
     <textarea class="exercise-note-input w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500 resize-y min-h-[60px] mb-4" rows="2" placeholder="Add note for this exercise">${escapeHtml(ex.exerciseNote)}</textarea>
     <div class="flex flex-wrap gap-2 mb-4"><button class="addSet bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">+ Add Set</button><button class="copyLast bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">Copy Last</button><button class="removeExercise text-red-400 hover:text-red-300 px-4 py-2 text-sm ml-auto">Remove</button></div>${exerciseProgressHtml(ex)}<div>${setsHtml}</div>`;
+    const moveExercise = (delta) => { workoutState.exercises = moveListItem(workoutState.exercises, exIndex, delta); renderWorkoutBuilder(); scheduleAutosave(); };
+    card.querySelector(".ex-move-up").addEventListener("click", () => moveExercise(-1));
+    card.querySelector(".ex-move-down").addEventListener("click", () => moveExercise(1));
     card.querySelector(".ex-fav-toggle").addEventListener("click", (e) => {
       e.preventDefault();
       toggleFavoriteExercise(ex.exerciseId);
@@ -2903,6 +2964,10 @@ function showWorkoutDetailsModal(workout, displayDate) {
     currentModalWorkout = workout;
     currentModalDisplayDate = displayDate;
     currentModalWorkoutId = workout.id; els.modalTitle.textContent = `Workout Details`;
+    // Date and removal go through server functions that only accept saved (final) workouts.
+    const isSavedWorkout = workout.status === "final";
+    if (els.editWorkoutDateBtn) els.editWorkoutDateBtn.disabled = !isSavedWorkout;
+    if (els.removeWorkoutBtn) els.removeWorkoutBtn.disabled = !isSavedWorkout;
     const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
     const sessionNotes = typeof workout.notes === "string" ? workout.notes.trim() : "";
     let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div>`;
@@ -3006,6 +3071,73 @@ els.editWorkoutFocusBtn?.addEventListener("click", async () => {
         els.editWorkoutFocusBtn.innerHTML = `<i class="fa-solid fa-bullseye mr-1"></i> Edit Focus`;
     }
 });
+/** After a server-side change to a saved workout: drop every cache derived from it and reload the lists. */
+async function refreshAfterSavedWorkoutChange(exerciseIds) {
+  invalidateFinalSetsCache(exerciseIds);
+  resetWorkoutAnalyticsCaches();
+  currentModalWorkout = null; currentModalWorkoutId = null; currentModalDisplayDate = "";
+  els.workoutModal?.close();
+  await Promise.allSettled([
+    refreshRecentWorkoutsPage({ reset: true, renderLoading: false }),
+    loadAnalytics(),
+  ]);
+}
+
+els.editWorkoutDateBtn?.addEventListener("click", async () => {
+  if (!currentUser || !currentModalWorkout) return;
+  const workout = currentModalWorkout;
+  const input = prompt(`Enter the correct date for this workout as YYYY-MM-DD.\nIt is currently on ${formatCalendarDate(workout.date)}.`, workout.date || "");
+  if (input == null) return;
+  let request;
+  try {
+    request = buildDateCorrectionRequest(workout, input, { todayKey: todayISO() });
+  } catch (error) {
+    return setStatus(error.message, "error");
+  }
+  try {
+    els.editWorkoutDateBtn.disabled = true;
+    // Preview first: the server must find exactly this one workout before anything is changed.
+    const preview = await httpsCallable(functions, "previewWorkoutDateCorrection")(request);
+    const matches = preview.data?.candidates || [];
+    if (matches.length !== 1 || matches[0].workoutId !== workout.id) {
+      return setStatus("Could not safely match this workout to change its date. Nothing was changed.", "error");
+    }
+    const label = String(workout.routineName || "this workout");
+    if (!confirm(`Move "${label}" (${matches[0].exercises.length} exercise(s)) from ${formatCalendarDate(request.originalDate)} to ${formatCalendarDate(request.newDate)}?\n\nOnly the date changes. Sets, notes and everything else stay the same.`)) return;
+    const result = await httpsCallable(functions, "correctFinalizedWorkoutDate")(request);
+    await refreshAfterSavedWorkoutChange(request.exerciseIds);
+    setStatus(
+      result.data?.derivedDataWarning
+        ? `Workout moved to ${formatCalendarDate(request.newDate)}. Some derived data will catch up shortly.`
+        : `Workout moved to ${formatCalendarDate(request.newDate)}.`,
+      "info"
+    );
+  } catch (error) {
+    console.error("Workout date change failed", error);
+    setStatus(String(error?.message || "Could not change the workout date.").replace(/^functions\//, ""), "error");
+  } finally {
+    if (els.editWorkoutDateBtn) els.editWorkoutDateBtn.disabled = currentModalWorkout?.status !== "final";
+  }
+});
+
+els.removeWorkoutBtn?.addEventListener("click", async () => {
+  if (!currentUser || !currentModalWorkoutId || currentModalWorkout?.status !== "final") return;
+  const workout = currentModalWorkout;
+  const exerciseIds = (workout.exercises || []).map((exercise) => exercise?.exerciseId).filter(Boolean);
+  if (!confirm(`Remove this workout from ${formatCalendarDate(workout.date)}${workout.routineName ? ` ("${workout.routineName}")` : ""}?\n\nIt disappears from your history, charts and "last time" numbers. It is archived rather than erased. Any personal record it set stays until you delete it on the PRs page.`)) return;
+  try {
+    els.removeWorkoutBtn.disabled = true;
+    await httpsCallable(functions, "archiveWorkout")({ workoutId: workout.id });
+    await refreshAfterSavedWorkoutChange(exerciseIds);
+    setStatus("Workout removed.", "info");
+  } catch (error) {
+    console.error("Workout removal failed", error);
+    setStatus(String(error?.message || "Could not remove the workout.").replace(/^functions\//, ""), "error");
+  } finally {
+    if (els.removeWorkoutBtn) els.removeWorkoutBtn.disabled = currentModalWorkout?.status !== "final";
+  }
+});
+
 els.closeModalBtn?.addEventListener("click", () => { currentModalWorkout = null; currentModalWorkoutId = null; currentModalDisplayDate = ""; els.workoutModal.close(); });
 
 // ==================== REST TIMER ====================

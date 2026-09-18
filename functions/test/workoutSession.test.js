@@ -260,3 +260,134 @@ test("PRs are written only by Functions: no client PR writer or client PR write 
   assert.doesNotMatch(prsRules, /allow (create|update|write)/);
   assert.doesNotMatch(rules, /validPr|isWeight/, "helpers for the removed PR client rule must go with it");
 });
+
+test("date correction request targets exactly one saved workout and is accepted by the server-side checks", async () => {
+  const { buildDateCorrectionRequest } = await loadClientModule("../../public/js/workoutSession.js");
+  const { selectDateRepairCandidates, buildDateRepairPlan } = require("../lib/workoutDateRepair");
+
+  const shoulders = {
+    id: "shoulders-1", status: "final", date: "2026-09-14", dateKey: "2026-09-14", routineName: "Shoulders",
+    finalizationId: "shoulders-1_111", finalizedAtMs: 1_700_000_222_000,
+    exercises: [{ exerciseId: "ohp" }, { exerciseId: "lateral-raise" }],
+  };
+  const legs = {
+    id: "legs-1", status: "final", date: "2026-09-14", dateKey: "2026-09-14", routineName: "Legs",
+    finalizationId: "legs-1_999", finalizedAtMs: 1_700_000_111_000,
+    exercises: [{ exerciseId: "squat" }, { exerciseId: "rdl" }],
+  };
+
+  const request = buildDateCorrectionRequest(shoulders, " 2026-09-15 ", { todayKey: "2026-09-18" });
+  assert.equal(request.workoutId, "shoulders-1");
+  assert.equal(request.originalDate, "2026-09-14");
+  assert.equal(request.newDate, "2026-09-15");
+  assert.deepEqual(request.exerciseIds, ["ohp", "lateral-raise"]);
+
+  // two workouts share the wrong date; the request must single out the shoulders workout only
+  const candidates = selectDateRepairCandidates([legs, shoulders], request);
+  assert.deepEqual(candidates.map((w) => w.id), ["shoulders-1"]);
+
+  // and the server's own repair plan accepts it and changes only the date fields
+  const plan = buildDateRepairPlan({
+    workoutId: request.workoutId, workout: shoulders, expectedOriginalDate: request.originalDate, newDate: request.newDate,
+    expectedFinalizationId: request.expectedFinalizationId, expectedFinalizedAtMs: request.expectedFinalizedAtMs,
+  });
+  assert.deepEqual(plan.workoutPatch, { date: "2026-09-15", dateKey: "2026-09-15" });
+
+  const rejects = (workout, newDate, opts, pattern) =>
+    assert.throws(() => buildDateCorrectionRequest(workout, newDate, opts), pattern);
+  rejects({ ...shoulders, status: "draft" }, "2026-09-15", {}, /saved workout/);
+  rejects(shoulders, "15/09/2026", {}, /YYYY-MM-DD/);
+  rejects(shoulders, "2026-02-30", {}, /YYYY-MM-DD/);
+  rejects(shoulders, "2026-09-14", {}, /already/);
+  rejects(shoulders, "2026-09-25", { todayKey: "2026-09-18" }, /future/);
+  rejects({ ...shoulders, finalizationId: "" }, "2026-09-15", {}, /older version/);
+  rejects({ ...shoulders, finalizedAtMs: 0 }, "2026-09-15", {}, /older version/);
+});
+
+test("workout details popup can change a saved workout's date and remove it through the server functions", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  const html = fs.readFileSync(path.resolve(__dirname, "../../public/index.html"), "utf8");
+  assert.match(html, /id="editWorkoutDateBtn"/);
+  assert.match(html, /id="removeWorkoutBtn"/);
+  // preview must run and be verified before the change is applied
+  const handler = appSource.match(/els\.editWorkoutDateBtn\?\.addEventListener\("click"[\s\S]*?\n\}\);/)[0];
+  assert.ok(handler.indexOf("previewWorkoutDateCorrection") < handler.indexOf("correctFinalizedWorkoutDate"));
+  assert.match(handler, /matches\.length !== 1 \|\| matches\[0\]\.workoutId !== workout\.id/);
+  assert.match(handler, /confirm\(/);
+  assert.match(appSource, /httpsCallable\(functions, "archiveWorkout"\)/);
+  // only saved workouts can use these buttons
+  assert.match(appSource, /els\.editWorkoutDateBtn\.disabled = !isSavedWorkout/);
+  assert.match(appSource, /els\.removeWorkoutBtn\.disabled = !isSavedWorkout/);
+  // caches derived from workouts are dropped afterwards
+  assert.match(appSource, /async function refreshAfterSavedWorkoutChange[\s\S]*invalidateFinalSetsCache\(exerciseIds\)[\s\S]*resetWorkoutAnalyticsCaches\(\)/);
+});
+
+test("moveListItem moves one item and never changes the input or the ends", async () => {
+  const { moveListItem } = await loadClientModule("../../public/js/workoutSession.js");
+  const list = ["squat", "rdl", "press", "row"];
+  assert.deepEqual(moveListItem(list, 2, -1), ["squat", "press", "rdl", "row"]);
+  assert.deepEqual(moveListItem(list, 0, 1), ["rdl", "squat", "press", "row"]);
+  assert.deepEqual(moveListItem(list, 0, -1), list, "moving the first item up does nothing");
+  assert.deepEqual(moveListItem(list, 3, 1), list, "moving the last item down does nothing");
+  assert.deepEqual(moveListItem(list, 9, -1), list);
+  assert.deepEqual(list, ["squat", "rdl", "press", "row"], "input is not mutated");
+  assert.deepEqual(moveListItem(null, 0, 1), []);
+});
+
+test("routines list is stable, keeps the user's order, and only rewrites what changed", async () => {
+  const { sortRoutines, moveRoutine } = await loadClientModule("../../public/js/workoutSession.js");
+  // never arranged: oldest first, then name (used to follow random document ids)
+  const legacy = [
+    { id: "z9", name: "Upper", createdAtMs: 300 },
+    { id: "a1", name: "Legs", createdAtMs: 100 },
+    { id: "m5", name: "Push", createdAtMs: 200 },
+    { id: "pending", name: "Just saved", createdAtMs: 0 },
+  ];
+  assert.deepEqual(sortRoutines(legacy).map((r) => r.id), ["a1", "m5", "z9", "pending"]);
+
+  // arranged routines come first in their order; a newly created one goes after them
+  const arranged = [
+    { id: "a1", name: "Legs", order: 1, createdAtMs: 100 },
+    { id: "z9", name: "Upper", order: 0, createdAtMs: 300 },
+    { id: "new", name: "Arms", createdAtMs: 400 },
+  ];
+  assert.deepEqual(sortRoutines(arranged).map((r) => r.id), ["z9", "a1", "new"]);
+
+  // first move on a never-arranged list numbers everything once, in the new order
+  const first = moveRoutine(sortRoutines(legacy), "z9", -1);
+  assert.deepEqual(first.routines.map((r) => r.id), ["a1", "z9", "m5", "pending"]);
+  assert.deepEqual(first.routines.map((r) => r.order), [0, 1, 2, 3]);
+  assert.equal(first.updates.length, 4);
+
+  // once arranged, a swap rewrites only the two routines that changed places
+  const second = moveRoutine(first.routines, "m5", -1);
+  assert.deepEqual(second.routines.map((r) => r.id), ["a1", "m5", "z9", "pending"]);
+  assert.deepEqual(second.updates, [{ id: "m5", order: 1 }, { id: "z9", order: 2 }]);
+
+  // impossible moves change nothing and write nothing
+  assert.deepEqual(moveRoutine(second.routines, "a1", -1).updates, []);
+  assert.deepEqual(moveRoutine(second.routines, "pending", 1).updates, []);
+  assert.deepEqual(moveRoutine(second.routines, "does-not-exist", 1).updates, []);
+});
+
+test("routines and exercises can be reordered in the UI, and the order is saved", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  const rules = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf8");
+
+  // routine list: sorted on load, moved through a batch write of `order`
+  assert.match(appSource, /loadedTemplates = sortRoutines\(/);
+  assert.match(appSource, /writeBatch\(db\)/);
+  assert.match(appSource, /batch\.update\(doc\(db, "users", currentUser\.uid, "templates", templateId\), \{ order \}\)/);
+  assert.match(appSource, /class="moveTemplateUp/);
+  assert.match(appSource, /class="moveTemplateDown/);
+  // failed save is reverted, not silently kept
+  assert.match(appSource, /loadedTemplates = previous;/);
+  // exercises inside the Edit Routine screen and the active workout
+  assert.match(appSource, /currentEditTemplateExercises = moveListItem\(currentEditTemplateExercises, idx, -1\)/);
+  assert.match(appSource, /workoutState\.exercises = moveListItem\(workoutState\.exercises, exIndex, delta\); renderWorkoutBuilder\(\); scheduleAutosave\(\);/);
+  // the saved routine keeps whatever order the exercises are in when it is saved
+  assert.match(appSource, /const templateExercises = workoutState\.exercises\.map\(ex => \(\{ exerciseId: ex\.exerciseId, name: ex\.name \}\)\)/);
+  // rules accept an integer order on routines
+  assert.match(rules, /hasOnly\(\["name", "exercises", "createdAt", "order"\]\)/);
+  assert.match(rules, /data\.order is int/);
+});

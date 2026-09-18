@@ -82,7 +82,8 @@ service cloud.firestore {
     }
 
     function validTemplate(data) {
-      return data.keys().hasOnly(["name", "exercises", "createdAt"]) &&
+      return data.keys().hasOnly(["name", "exercises", "createdAt", "order"]) &&
+        (!data.keys().hasAny(["order"]) || data.order is int) &&
         isNonEmptyString(data.name, 80) &&
         data.exercises is list &&
         data.exercises.size() <= 25;

@@ -252,3 +252,75 @@ export function resolveExerciseSessions({
   if (history?.complete || sessions.length >= limit) return sessions;
   return normalizeCachedExerciseSessions([...sessions, ...derivedSessions], limit, isCompletedSet);
 }
+
+/**
+ * Payload for the previewWorkoutDateCorrection / correctFinalizedWorkoutDate Cloud Functions, which only accept a
+ * saved workout and pin it by id, finalization id and finalization time so no other workout can be touched.
+ * Throws a user-readable Error when the workout or the new date cannot be corrected.
+ */
+export function buildDateCorrectionRequest(workout, newDate, { todayKey = "" } = {}) {
+  if (workout?.status !== "final") throw new Error("Only a saved workout can have its date changed.");
+  const originalDate = isCalendarDateKey(workout.date) ? workout.date : "";
+  if (!originalDate) throw new Error("This workout has no valid date to correct.");
+  const target = String(newDate ?? "").trim();
+  if (!isCalendarDateKey(target)) throw new Error("Enter the date as YYYY-MM-DD, for example 2026-09-15.");
+  if (target === originalDate) throw new Error("That is already this workout's date.");
+  if (isCalendarDateKey(todayKey) && target > todayKey) throw new Error("A workout cannot be dated in the future.");
+  const finalizedAtMs = Number(workout.finalizedAtMs) || 0;
+  const finalizationId = String(workout.finalizationId || "").trim();
+  if (!workout.id || !finalizedAtMs || !finalizationId) {
+    throw new Error("This workout was saved by an older version, so its date cannot be corrected here.");
+  }
+  return {
+    workoutId: workout.id,
+    originalDate,
+    newDate: target,
+    finalizedAfterMs: finalizedAtMs,
+    finalizedBeforeMs: finalizedAtMs,
+    exerciseIds: (Array.isArray(workout.exercises) ? workout.exercises : [])
+      .map((exercise) => String(exercise?.exerciseId || "").trim())
+      .filter(Boolean),
+    expectedFinalizationId: finalizationId,
+    expectedFinalizedAtMs: finalizedAtMs,
+  };
+}
+
+/** Copy of `list` with the item at `index` moved by `delta` places (-1 = up, +1 = down). Out-of-range moves change nothing. */
+export function moveListItem(list, index, delta) {
+  const items = Array.isArray(list) ? [...list] : [];
+  const target = index + delta;
+  if (!Number.isInteger(index) || index < 0 || index >= items.length || target < 0 || target >= items.length) return items;
+  const [moved] = items.splice(index, 1);
+  items.splice(target, 0, moved);
+  return items;
+}
+
+/**
+ * Routines in the order the user arranged them (`order`, ascending). Routines that were never arranged follow, oldest
+ * first (`createdAtMs`, unknown = newest) and then by name, so the list is stable instead of following random ids.
+ */
+export function sortRoutines(routines) {
+  const hasOrder = (routine) => Number.isFinite(Number(routine?.order)) && routine.order !== null && routine.order !== "";
+  const created = (routine) => (Number.isFinite(Number(routine?.createdAtMs)) && routine.createdAtMs ? Number(routine.createdAtMs) : Infinity);
+  return [...(Array.isArray(routines) ? routines : [])].sort((a, b) => {
+    if (hasOrder(a) !== hasOrder(b)) return hasOrder(a) ? -1 : 1;
+    if (hasOrder(a)) return Number(a.order) - Number(b.order) || String(a.name || "").localeCompare(String(b.name || ""));
+    const byCreated = created(a) === created(b) ? 0 : created(a) < created(b) ? -1 : 1;
+    return byCreated || String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" });
+  });
+}
+
+/**
+ * Moves one routine up or down in an already sorted list. Returns the new list plus only the `order` values that
+ * actually changed (every routine gets its position as `order`, so a first move also fixes never-arranged routines).
+ */
+export function moveRoutine(sortedRoutines, id, delta) {
+  const current = Array.isArray(sortedRoutines) ? sortedRoutines : [];
+  const from = current.findIndex((routine) => routine?.id === id);
+  const moved = moveListItem(current, from, delta);
+  const routines = moved.map((routine, index) => ({ ...routine, order: index }));
+  const updates = routines
+    .filter((routine, index) => current.find((old) => old.id === routine.id)?.order !== index)
+    .map((routine) => ({ id: routine.id, order: routine.order }));
+  return { routines, updates };
+}

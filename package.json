@@ -7,6 +7,10 @@
     "emulators": "firebase emulators:start",
     "deploy": "firebase deploy",
     "predeploy:check": "npm run lint",
-    "secret:openai": "./scripts/set-openai-secret.sh"
+    "secret:openai": "./scripts/set-openai-secret.sh",
+    "build:assets": "node scripts/build-assets.mjs"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
   }
 }
