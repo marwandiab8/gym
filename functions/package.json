@@ -8,7 +8,7 @@
   "scripts": {
     "lint": "node --check index.js",
     "smoke": "node --check index.js",
-    "test": "node --test test/setScoring.test.js test/aiRoutine.test.js",
+    "test": "node --test test/setScoring.test.js test/aiRoutine.test.js test/timeLeftGym.test.js test/navigation.test.js test/workoutSession.test.js test/workoutDateRepair.test.js",
     "serve": "cd .. && firebase emulators:start --only functions,firestore,hosting",
     "shell": "cd .. && firebase functions:shell",
     "predeploy:check": "npm run lint && npm run smoke && npm test"

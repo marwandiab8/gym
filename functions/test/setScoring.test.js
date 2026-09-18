@@ -1,8 +1,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   prSetVolume,
   pickBestSetForPR,
+  completedExerciseSetRows,
+  completedSetRows,
   filterScorableSets,
   isNewPRBeatsCurrent,
   buildExerciseSummaries,
@@ -65,4 +69,37 @@ test("filterScorableSets drops zero-rep rows", () => {
   const v = filterScorableSets(sets);
   assert.equal(v.length, 1);
   assert.deepEqual(v[0], { weight: 0, reps: 12 });
+});
+
+test("completed historical rows require reps but preserve legitimate zero weight", () => {
+  const sets = [
+    { weight: "100", reps: "0", rpe: "" },
+    { weight: "", reps: "", rpe: "" },
+    { weight: "0", reps: "12", rpe: "8" },
+  ];
+  assert.deepEqual(completedSetRows(sets), [{ weight: "0", reps: "12", rpe: "8" }]);
+});
+
+test("untouched generated/default exercise rows do not count as completed history", () => {
+  assert.deepEqual(completedExerciseSetRows({
+    firstEditTime: null,
+    lastEditTime: null,
+    sets: [{ weight: "0", reps: "10" }],
+  }), []);
+  assert.deepEqual(completedExerciseSetRows({
+    firstEditTime: 123,
+    lastEditTime: 123,
+    sets: [{ weight: "0", reps: "10" }],
+  }), [{ weight: "0", reps: "10" }]);
+});
+
+test("backend last-set derivation paginates past skipped workouts and caches only completed rows", () => {
+  const source = fs.readFileSync(path.resolve(__dirname, "../index.js"), "utf8");
+  const start = source.indexOf("async function syncLastSetsForExercises");
+  const end = source.indexOf("async function syncPrsForWorkoutInTransaction");
+  const implementation = source.slice(start, end);
+  assert.match(implementation, /completedExerciseSetRows\(exercise\)/);
+  assert.match(implementation, /sourceExerciseCompleted: true/);
+  assert.match(implementation, /startAfter\(cursor\)/);
+  assert.match(implementation, /where\("status", "==", WORKOUT_STATUSES\.FINAL\)/);
 });

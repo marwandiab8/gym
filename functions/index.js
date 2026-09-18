@@ -2,6 +2,7 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const {
   buildExerciseSummaries,
+  completedExerciseSetRows,
   filterScorableSets,
   pickBestSetForPR,
   isNewPRBeatsCurrent,
@@ -12,6 +13,14 @@ const {
   extractJsonCandidate,
   normalizeAiExercises,
 } = require("./lib/aiRoutine");
+const {
+  buildDateRepairPlan,
+  normalizeDateKey,
+  prDateRepairPatch,
+  resolveWorkoutDateFields,
+  selectDateRepairCandidates,
+  timestampToMs,
+} = require("./lib/workoutDateRepair");
 
 admin.initializeApp();
 
@@ -63,11 +72,6 @@ async function enforceAiRateLimit(uid) {
       lastRequestAtMs: now,
     }, { merge: true });
   });
-}
-
-function normalizeDateString(value) {
-  const trimmed = String(value || "").trim();
-  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : "";
 }
 
 function normalizeUnit(value) {
@@ -132,10 +136,13 @@ function buildFinalExercisesForStorage(rawExercises, fallbackAddedAt) {
 }
 
 function buildWorkoutSummaryRecord(workoutId, workout) {
+  const workoutDate = normalizeDateKey(workout.date);
+  const workoutDateKey = normalizeDateKey(workout.dateKey || workout.date);
   return {
     workoutId,
     routineName: String(workout.routineName || "Custom Workout"),
-    date: typeof workout.date === "string" ? workout.date : null,
+    date: workoutDate || null,
+    dateKey: workoutDateKey || workoutDate || null,
     unit: typeof workout.unit === "string" ? workout.unit : "lb",
     focus: Array.isArray(workout.focus) ? workout.focus.filter((item) => typeof item === "string").slice(0, 8) : [],
     notes: typeof workout.notes === "string" ? workout.notes : "",
@@ -152,15 +159,20 @@ function sanitizeFinalizeRequest(data) {
     throw new functions.https.HttpsError("invalid-argument", "Invalid finalize payload.");
   }
   const workoutId = clampString(data.workoutId, 120);
-  const date = normalizeDateString(data.date);
-  if (!workoutId || !date) {
+  let dateFields;
+  try {
+    dateFields = resolveWorkoutDateFields(data.date, data.dateKey || data.date);
+  } catch (_) {
+    dateFields = null;
+  }
+  if (!workoutId || !dateFields) {
     throw new functions.https.HttpsError("invalid-argument", "Workout id and date are required.");
   }
   const finalizationId = clampString(data.finalizationId, 120) || `finalize_${workoutId}`;
   const sanitized = {
     workoutId,
     finalizationId,
-    date,
+    ...dateFields,
     unit: normalizeUnit(data.unit),
     routineName: clampString(data.routineName, 80, "Custom Workout"),
     focus: normalizeStringList(data.focus, 8, 40),
@@ -178,12 +190,17 @@ function sanitizeDraftRequest(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new functions.https.HttpsError("invalid-argument", "Invalid draft payload.");
   }
-  const date = normalizeDateString(data.date);
-  if (!date) {
+  let dateFields;
+  try {
+    dateFields = resolveWorkoutDateFields(data.date, data.dateKey || data.date);
+  } catch (_) {
+    dateFields = null;
+  }
+  if (!dateFields) {
     throw new functions.https.HttpsError("invalid-argument", "Draft date is required.");
   }
   return {
-    date,
+    ...dateFields,
     unit: normalizeUnit(data.unit),
     exercises: Array.isArray(data.exercises) ? data.exercises.slice(0, MAX_WORKOUT_EXERCISES) : [],
     routineName: clampString(data.routineName, 80, "Custom Workout"),
@@ -191,6 +208,42 @@ function sanitizeDraftRequest(data) {
     templateId: clampString(data.templateId, 120) || null,
     notes: clampString(data.notes, 2000),
   };
+}
+
+function sanitizeDateRepairPreviewRequest(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid date-repair preview payload.");
+  }
+  const originalDate = normalizeDateKey(data.originalDate);
+  const newDate = normalizeDateKey(data.newDate);
+  if (!originalDate || !newDate || originalDate === newDate) {
+    throw new functions.https.HttpsError("invalid-argument", "Distinct original and corrected dates are required.");
+  }
+  const finalizedAfterMs = Math.max(0, Number(data.finalizedAfterMs) || 0);
+  const finalizedBeforeMs = Math.max(finalizedAfterMs, Number(data.finalizedBeforeMs) || Number.MAX_SAFE_INTEGER);
+  return {
+    originalDate,
+    newDate,
+    finalizedAfterMs,
+    finalizedBeforeMs,
+    exerciseIds: [...new Set((Array.isArray(data.exerciseIds) ? data.exerciseIds : [])
+      .map((exerciseId) => clampString(exerciseId, 120))
+      .filter(Boolean))].slice(0, MAX_WORKOUT_EXERCISES),
+  };
+}
+
+function sanitizeDateRepairRequest(data) {
+  const preview = sanitizeDateRepairPreviewRequest(data);
+  const workoutId = clampString(data.workoutId, 120);
+  const expectedFinalizationId = clampString(data.expectedFinalizationId, 120);
+  const expectedFinalizedAtMs = Number(data.expectedFinalizedAtMs);
+  if (!workoutId || !expectedFinalizationId || !Number.isFinite(expectedFinalizedAtMs) || expectedFinalizedAtMs <= 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Workout id, finalization id, and finalization timestamp are required."
+    );
+  }
+  return { ...preview, workoutId, expectedFinalizationId, expectedFinalizedAtMs };
 }
 
 function collectExerciseIds(workout) {
@@ -219,30 +272,41 @@ async function syncWorkoutSummary(uid, workoutId, workout) {
 
 async function syncLastSetsForExercises(uid, exerciseIds) {
   if (!exerciseIds.length) return;
-
-  const workoutsSnap = await admin.firestore()
-    .collection(`users/${uid}/workouts`)
-    .where("status", "==", WORKOUT_STATUSES.FINAL)
-    .orderBy("updatedAtMs", "desc")
-    .limit(EXERCISE_LAST_SETS_LIMIT)
-    .get();
-
   const latestByExerciseId = new Map();
-  for (const workoutDoc of workoutsSnap.docs) {
-    const workout = workoutDoc.data();
-    for (const exercise of workout.exercises || []) {
-      const exerciseId = exercise?.exerciseId;
-      if (!exerciseIds.includes(exerciseId) || latestByExerciseId.has(exerciseId)) continue;
-      if (Array.isArray(exercise.sets) && exercise.sets.length) {
-        latestByExerciseId.set(exerciseId, {
-          sets: exercise.sets,
-          sourceWorkoutId: workoutDoc.id,
-          updatedAtMs: Number(workout.updatedAtMs) || Date.now(),
-          exerciseName: String(exercise.name || "Exercise"),
-        });
+  let cursor = null;
+  while (latestByExerciseId.size < exerciseIds.length) {
+    let workoutsQuery = admin.firestore()
+      .collection(`users/${uid}/workouts`)
+      .where("status", "==", WORKOUT_STATUSES.FINAL)
+      .orderBy("updatedAtMs", "desc")
+      .limit(EXERCISE_LAST_SETS_LIMIT);
+    if (cursor) workoutsQuery = workoutsQuery.startAfter(cursor);
+    const workoutsSnap = await workoutsQuery.get();
+    if (workoutsSnap.empty) break;
+
+    for (const workoutDoc of workoutsSnap.docs) {
+      const workout = workoutDoc.data();
+      for (const exercise of workout.exercises || []) {
+        const exerciseId = exercise?.exerciseId;
+        if (!exerciseIds.includes(exerciseId) || latestByExerciseId.has(exerciseId)) continue;
+        const completedSets = completedExerciseSetRows(exercise);
+        if (completedSets.length) {
+          latestByExerciseId.set(exerciseId, {
+            sets: completedSets,
+            exerciseNote: clampString(exercise.exerciseNote, 500),
+            sourceWorkoutId: workoutDoc.id,
+            sourceWorkoutDate: typeof workout.date === "string" ? workout.date : null,
+            sourceExerciseCompleted: true,
+            unit: normalizeUnit(workout.unit),
+            updatedAtMs: Number(workout.updatedAtMs) || Date.now(),
+            exerciseName: String(exercise.name || "Exercise"),
+          });
+        }
       }
+      if (latestByExerciseId.size === exerciseIds.length) break;
     }
-    if (latestByExerciseId.size === exerciseIds.length) break;
+    if (workoutsSnap.size < EXERCISE_LAST_SETS_LIMIT) break;
+    cursor = workoutsSnap.docs[workoutsSnap.docs.length - 1];
   }
 
   const batch = admin.firestore().batch();
@@ -258,7 +322,7 @@ async function syncLastSetsForExercises(uid, exerciseIds) {
 }
 
 async function syncPrsForWorkoutInTransaction(tx, uid, workoutId, workout, finalizationId, nowMs) {
-  const prUpdates = [];
+  const candidates = [];
   for (const exercise of workout.exercises || []) {
     const validSets = filterScorableSets(exercise.sets);
     if (!validSets.length) continue;
@@ -266,9 +330,22 @@ async function syncPrsForWorkoutInTransaction(tx, uid, workoutId, workout, final
     if (!best) continue;
 
     const prRef = admin.firestore().doc(`users/${uid}/prs/${exercise.exerciseId}`);
-    const prSnap = await tx.get(prRef);
+    candidates.push({ exercise, best, prRef });
+  }
+
+  // Firestore transactions require all reads before all writes. Read every PR
+  // candidate first, then queue the winning PR updates.
+  const currentPrs = [];
+  for (const candidate of candidates) {
+    currentPrs.push(await tx.get(candidate.prRef));
+  }
+
+  const prUpdates = [];
+  candidates.forEach((candidate, index) => {
+    const { exercise, best, prRef } = candidate;
+    const prSnap = currentPrs[index];
     const current = prSnap.exists ? prSnap.data() : { weight: 0, reps: 0 };
-    if (!isNewPRBeatsCurrent(best, current)) continue;
+    if (!isNewPRBeatsCurrent(best, current)) return;
 
     const prPayload = {
       exerciseId: exercise.exerciseId,
@@ -291,7 +368,7 @@ async function syncPrsForWorkoutInTransaction(tx, uid, workoutId, workout, final
       reps: best.reps,
       date: workout.date,
     });
-  }
+  });
   return prUpdates;
 }
 
@@ -470,6 +547,7 @@ exports.finalizeWorkout = functions
       const finalizedWorkout = {
         status: WORKOUT_STATUSES.FINAL,
         date: payload.date,
+        dateKey: payload.dateKey,
         unit: payload.unit,
         exercises: payload.exercises,
         updatedAtMs: nowMs,
@@ -486,7 +564,6 @@ exports.finalizeWorkout = functions
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
-      tx.set(workoutRef, finalizedWorkout, { merge: true });
       let prUpdates = [];
       let prSyncError = null;
       try {
@@ -506,10 +583,12 @@ exports.finalizeWorkout = functions
           message: prSyncError,
         });
       }
+      tx.set(workoutRef, finalizedWorkout, { merge: true });
       tx.set(summaryRef, buildWorkoutSummaryRecord(payload.workoutId, finalizedWorkout), { merge: true });
       tx.set(receiptRef, {
         workoutId: payload.workoutId,
         workoutDate: payload.date,
+        workoutDateKey: payload.dateKey,
         routineName: payload.routineName,
         status: WORKOUT_STATUSES.FINAL,
         finalizationId: payload.finalizationId,
@@ -528,28 +607,12 @@ exports.finalizeWorkout = functions
     } catch (error) {
       verificationWarning = verificationWarning || String(error?.message || error);
     }
-    try {
-      await syncLastSetsForExercises(uid, collectExerciseIds(txResult.workout));
-    } catch (error) {
-      verificationWarning = verificationWarning || String(error?.message || error);
-    }
-    try {
-      const report = await runIntegrityCheckAndRepair(uid);
-      await receiptRef.set({
-        verified: !verificationWarning,
-        verifiedAtMs: Date.now(),
-        integrityIssueCount: Number(report.issueCount) || 0,
-        verificationError: verificationWarning || null,
-        verificationFailedAtMs: verificationWarning ? Date.now() : null,
-      }, { merge: true });
-    } catch (error) {
-      verificationWarning = verificationWarning || String(error?.message || error);
-      await receiptRef.set({
-        verified: false,
-        verificationError: verificationWarning,
-        verificationFailedAtMs: Date.now(),
-      }, { merge: true }).catch(() => null);
-    }
+    await receiptRef.set({
+      verified: !verificationWarning,
+      verifiedAtMs: Date.now(),
+      verificationError: verificationWarning || null,
+      verificationFailedAtMs: verificationWarning ? Date.now() : null,
+    }, { merge: true }).catch(() => null);
 
     return {
       ok: true,
@@ -642,6 +705,196 @@ exports.runWorkoutIntegrityCheck = functions
     return { ok: true, report };
   });
 
+exports.previewWorkoutDateCorrection = functions
+  .runWith({ timeoutSeconds: 60, memory: "256MB" })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+    }
+    const criteria = sanitizeDateRepairPreviewRequest(data);
+    const snap = await admin.firestore()
+      .collection(`users/${uid}/workouts`)
+      .where("status", "==", WORKOUT_STATUSES.FINAL)
+      .where("date", "==", criteria.originalDate)
+      .limit(30)
+      .get();
+    const records = snap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    const candidates = selectDateRepairCandidates(records, criteria).map((workout) => ({
+      workoutId: workout.id,
+      date: workout.date,
+      dateKey: workout.dateKey || workout.date,
+      routineName: clampString(workout.routineName, 80, "Custom Workout"),
+      startedAtMs: timestampToMs(workout.startedAt),
+      finishedAtMs: timestampToMs(workout.finishedAt),
+      finalizedAtMs: Number(workout.finalizedAtMs) || 0,
+      updatedAtMs: Number(workout.updatedAtMs) || 0,
+      finalizationId: clampString(workout.finalizationId, 120),
+      exercises: (Array.isArray(workout.exercises) ? workout.exercises : []).map((exercise) => ({
+        exerciseId: clampString(exercise?.exerciseId, 120),
+        name: clampString(exercise?.name, 120, "Exercise"),
+        sets: (Array.isArray(exercise?.sets) ? exercise.sets : []).map(sanitizeSet),
+      })),
+    }));
+    return {
+      ok: true,
+      originalDate: criteria.originalDate,
+      newDate: criteria.newDate,
+      candidateCount: candidates.length,
+      candidates,
+    };
+  });
+
+exports.correctFinalizedWorkoutDate = functions
+  .runWith({ timeoutSeconds: 60, memory: "256MB" })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+    }
+    const payload = sanitizeDateRepairRequest(data);
+    const repairDocumentId = `date_${payload.workoutId}_${payload.originalDate}_${payload.newDate}`
+      .replace(/[^a-zA-Z0-9_-]/g, "_")
+      .slice(0, 300);
+    const workoutRef = admin.firestore().doc(`users/${uid}/workouts/${payload.workoutId}`);
+    const summaryRef = admin.firestore().doc(`users/${uid}/workout_summaries/${payload.workoutId}`);
+    const receiptRef = admin.firestore().doc(`users/${uid}/workout_receipts/${payload.workoutId}`);
+    const repairRef = admin.firestore().doc(`users/${uid}/workout_date_repairs/${repairDocumentId}`);
+
+    const existingRepair = await repairRef.get();
+    if (!existingRepair.exists || existingRepair.data()?.status !== "applied") {
+      const candidateSnap = await admin.firestore()
+        .collection(`users/${uid}/workouts`)
+        .where("status", "==", WORKOUT_STATUSES.FINAL)
+        .where("date", "==", payload.originalDate)
+        .limit(30)
+        .get();
+      const candidates = selectDateRepairCandidates(
+        candidateSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+        payload
+      );
+      if (candidates.length !== 1 || candidates[0].id !== payload.workoutId) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          `Date correction requires exactly one matching workout; found ${candidates.length}. Run the preview again.`
+        );
+      }
+    }
+
+    const result = await admin.firestore().runTransaction(async (tx) => {
+      const repairSnap = await tx.get(repairRef);
+      if (repairSnap.exists && repairSnap.data()?.status === "applied") {
+        return {
+          alreadyApplied: true,
+          exerciseIds: Array.isArray(repairSnap.data()?.exerciseIds) ? repairSnap.data().exerciseIds : [],
+        };
+      }
+
+      const workoutSnap = await tx.get(workoutRef);
+      if (!workoutSnap.exists) {
+        throw new functions.https.HttpsError("not-found", "Workout not found.");
+      }
+      const workout = workoutSnap.data() || {};
+      let plan;
+      try {
+        plan = buildDateRepairPlan({
+          workoutId: payload.workoutId,
+          workout,
+          expectedOriginalDate: payload.originalDate,
+          newDate: payload.newDate,
+          expectedFinalizationId: payload.expectedFinalizationId,
+          expectedFinalizedAtMs: payload.expectedFinalizedAtMs,
+        });
+      } catch (error) {
+        throw new functions.https.HttpsError("failed-precondition", error.message);
+      }
+
+      const exerciseIds = collectExerciseIds(workout);
+      const summarySnap = await tx.get(summaryRef);
+      const receiptSnap = await tx.get(receiptRef);
+      const prRows = [];
+      for (const exerciseId of exerciseIds) {
+        const ref = admin.firestore().doc(`users/${uid}/prs/${exerciseId}`);
+        prRows.push({ exerciseId, ref, snap: await tx.get(ref) });
+      }
+
+      const correctedWorkout = { ...workout, ...plan.workoutPatch };
+      const originalPrs = [];
+      const updatedPrIds = [];
+      for (const row of prRows) {
+        const currentPr = row.snap.exists ? row.snap.data() || {} : null;
+        const patch = prDateRepairPatch(currentPr, payload.workoutId, payload.newDate);
+        originalPrs.push({
+          exerciseId: row.exerciseId,
+          existed: row.snap.exists,
+          date: currentPr?.date || null,
+          sourceWorkoutDate: currentPr?.sourceWorkoutDate || null,
+          sourceWorkoutId: currentPr?.sourceWorkoutId || null,
+        });
+        if (patch) {
+          tx.set(row.ref, patch, { merge: true });
+          updatedPrIds.push(row.exerciseId);
+        }
+      }
+
+      tx.set(workoutRef, plan.workoutPatch, { merge: true });
+      tx.set(summaryRef, buildWorkoutSummaryRecord(payload.workoutId, correctedWorkout), { merge: true });
+      if (receiptSnap.exists) tx.set(receiptRef, plan.receiptPatch, { merge: true });
+      tx.set(repairRef, {
+        status: "applied",
+        workoutId: payload.workoutId,
+        ownerUid: uid,
+        originalDate: payload.originalDate,
+        newDate: payload.newDate,
+        finalizationId: payload.expectedFinalizationId,
+        finalizedAtMs: payload.expectedFinalizedAtMs,
+        exerciseIds,
+        updatedPrIds,
+        originalValues: {
+          workout: { date: workout.date || null, dateKey: workout.dateKey || null },
+          summary: {
+            existed: summarySnap.exists,
+            date: summarySnap.data()?.date || null,
+            dateKey: summarySnap.data()?.dateKey || null,
+          },
+          receipt: {
+            existed: receiptSnap.exists,
+            workoutDate: receiptSnap.data()?.workoutDate || null,
+            workoutDateKey: receiptSnap.data()?.workoutDateKey || null,
+          },
+          prs: originalPrs,
+        },
+        appliedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { alreadyApplied: false, exerciseIds, updatedPrIds };
+    });
+
+    let derivedDataWarning = null;
+    try {
+      // Also run on an idempotent retry so a prior post-transaction sync failure
+      // can heal without rewriting the finalized workout again.
+      await syncLastSetsForExercises(uid, result.exerciseIds);
+    } catch (error) {
+      derivedDataWarning = String(error?.message || error);
+      console.error("Date-correction last-set sync failed", {
+        uid,
+        workoutId: payload.workoutId,
+        message: derivedDataWarning,
+      });
+    }
+    return {
+      ok: true,
+      alreadyApplied: result.alreadyApplied,
+      workoutId: payload.workoutId,
+      originalDate: payload.originalDate,
+      newDate: payload.newDate,
+      updatedPrIds: result.updatedPrIds || [],
+      derivedDataWarning,
+    };
+  });
+
 exports.createWorkoutDraft = functions
   .runWith({
     timeoutSeconds: 60,
@@ -659,6 +912,7 @@ exports.createWorkoutDraft = functions
     await workoutRef.set({
       status: WORKOUT_STATUSES.DRAFT,
       date: payload.date,
+      dateKey: payload.dateKey,
       unit: payload.unit,
       exercises: payload.exercises,
       startedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -793,3 +1047,5 @@ exports.generateAiRoutine = functions
       };
     }
   });
+
+Object.assign(exports, require("./timeLeftGym/triggers"));

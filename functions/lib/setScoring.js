@@ -11,12 +11,56 @@ function parseWeight(v) {
   return Number(v) || 0;
 }
 
+/** A historical set is completed when reps were deliberately recorded. Weight may legitimately be zero. */
+function isCompletedSet(set) {
+  return parseReps(set?.reps) > 0;
+}
+
+function completedSetRows(sets) {
+  return (Array.isArray(sets) ? sets : []).filter(isCompletedSet);
+}
+
+function completedExerciseSetRows(exercise) {
+  const sets = completedSetRows(exercise?.sets);
+  const hasInteractionTracking = exercise && (
+    Object.prototype.hasOwnProperty.call(exercise, "firstEditTime") ||
+    Object.prototype.hasOwnProperty.call(exercise, "lastEditTime")
+  );
+  if (hasInteractionTracking && !Number(exercise.firstEditTime) && !Number(exercise.lastEditTime)) return [];
+  return sets;
+}
+
 /** Volume = weight × reps when weight > 0; otherwise rep count (bodyweight / unloaded). */
 function prSetVolume(set) {
   const w = parseWeight(set.weight);
   const r = parseReps(set.reps);
   if (w > 0) return w * r;
   return r;
+}
+
+function compactSetValue(value) {
+  const trimmed = String(value == null ? "" : value).trim();
+  if (!trimmed) return "";
+  return trimmed.slice(0, 24);
+}
+
+function summarySet(set) {
+  const weight = compactSetValue(set?.weight);
+  const reps = compactSetValue(set?.reps);
+  const rpe = compactSetValue(set?.rpe);
+  if (!weight && !reps && !rpe) return null;
+  return {
+    weight,
+    reps,
+    rpe,
+  };
+}
+
+function allSetSummaries(sets) {
+  return (Array.isArray(sets) ? sets : [])
+    .map(summarySet)
+    .filter(Boolean)
+    .slice(0, 50);
 }
 
 function pickBestSetForPR(validSets) {
@@ -35,7 +79,7 @@ function pickBestSetForPR(validSets) {
 
 /** Sets with at least one rep, or positive weight with reps (reps required for loaded volume). */
 function filterScorableSets(sets) {
-  return (Array.isArray(sets) ? sets : [])
+  return completedSetRows(sets)
     .map((raw) => ({ weight: parseWeight(raw?.weight), reps: parseReps(raw?.reps) }))
     .filter((s) => s.reps > 0);
 }
@@ -76,6 +120,7 @@ function buildExerciseSummaries(workout) {
         bestReps: best.reps,
         maxWeight: best.weight,
         maxReps: best.reps,
+        sets: allSetSummaries(exercise.sets),
       };
     });
 }
@@ -83,9 +128,14 @@ function buildExerciseSummaries(workout) {
 module.exports = {
   parseReps,
   parseWeight,
+  isCompletedSet,
+  completedSetRows,
+  completedExerciseSetRows,
   prSetVolume,
   pickBestSetForPR,
   filterScorableSets,
   isNewPRBeatsCurrent,
   buildExerciseSummaries,
+  allSetSummaries,
+  summarySet,
 };

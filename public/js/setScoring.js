@@ -10,6 +10,25 @@ export function parseWeight(v) {
   return Number(v) || 0;
 }
 
+/** A historical set is completed when reps were deliberately recorded. Weight may legitimately be zero. */
+export function isCompletedSet(set) {
+  return parseReps(set?.reps) > 0;
+}
+
+export function completedSetRows(sets) {
+  return (Array.isArray(sets) ? sets : []).filter(isCompletedSet);
+}
+
+export function completedExerciseSetRows(exercise) {
+  const sets = completedSetRows(exercise?.sets);
+  const hasInteractionTracking = exercise && (
+    Object.prototype.hasOwnProperty.call(exercise, "firstEditTime") ||
+    Object.prototype.hasOwnProperty.call(exercise, "lastEditTime")
+  );
+  if (hasInteractionTracking && !Number(exercise.firstEditTime) && !Number(exercise.lastEditTime)) return [];
+  return sets;
+}
+
 /** Volume = weight × reps when weight > 0; otherwise rep count (bodyweight / unloaded). */
 export function prSetVolume(set) {
   const w = parseWeight(set.weight);
@@ -33,7 +52,7 @@ export function pickBestSetForPR(validSets) {
 }
 
 export function filterScorableSets(sets) {
-  return (Array.isArray(sets) ? sets : [])
+  return completedSetRows(sets)
     .map((raw) => ({ weight: parseWeight(raw?.weight), reps: parseReps(raw?.reps) }))
     .filter((s) => s.reps > 0);
 }

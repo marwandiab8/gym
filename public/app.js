@@ -1,14 +1,29 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer, startAfter } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
 import {
   pickBestSetForPR,
+  completedExerciseSetRows,
   filterScorableSets,
+  isCompletedSet,
   isNewPRBeatsCurrent,
+  prSetVolume,
   chartPeakFromSummary,
   chartPeakFromRawExercise,
 } from "./js/setScoring.js";
+import {
+  applyDraftDateChoice,
+  compareSetPerformance,
+  formatCalendarDate,
+  localCalendarDateKey,
+  needsWorkoutDateConfirmation,
+  normalizeCachedExerciseSessions,
+  previousSetPlaceholder,
+  progressStateMessage,
+  resolveNewWorkoutDate,
+  selectPreviousExerciseSessions,
+} from "./js/workoutSession.js";
 
 const firebaseConfig = { 
   apiKey: "AIzaSyBXKNG9Aoc_a6yRBJYinEl8ec-i_5YwHhI",
@@ -22,20 +37,26 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const functions = getFunctions(app);
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: "select_account" });
 
 const els = {
   activeWorkoutBadge: document.getElementById("activeWorkoutBadge"),
   mobileMenuBtn: document.getElementById("mobileMenuBtn"),
   mobileNavPanel: document.getElementById("mobileNavPanel"),
   aiErrorBanner: document.getElementById("aiErrorBanner"),
-  userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"),
+  homeView: document.getElementById("homeView"),
+  recentView: document.getElementById("recentView"),
+  routinesView: document.getElementById("routinesView"),
+  userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), createCustomExerciseBtn: document.getElementById("createCustomExerciseBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"), recentWorkoutsPreview: document.getElementById("recentWorkoutsPreview"), loadMoreWorkoutsBtn: document.getElementById("loadMoreWorkoutsBtn"),
   workoutModal: document.getElementById("workoutModal"), modalTitle: document.getElementById("modalTitle"), modalContent: document.getElementById("modalContent"), closeModalBtn: document.getElementById("closeModalBtn"),
   toggleTimerBtn: document.getElementById("toggleTimerBtn"), restTimerWidget: document.getElementById("restTimerWidget"), timerDisplay: document.getElementById("timerDisplay"), timerAddBtn: document.getElementById("timerAddBtn"), timerPlayPauseBtn: document.getElementById("timerPlayPauseBtn"), timerStopBtn: document.getElementById("timerStopBtn"), timerCloseBtn: document.getElementById("timerCloseBtn"),
   chartExerciseSelect: document.getElementById("chartExerciseSelect"),
   templateModal: document.getElementById("templateModal"), closeTemplateModalBtn: document.getElementById("closeTemplateModalBtn"), editTemplateName: document.getElementById("editTemplateName"), editTemplateExercises: document.getElementById("editTemplateExercises"), saveTemplateChangesBtn: document.getElementById("saveTemplateChangesBtn"), deleteTemplateModalBtn: document.getElementById("deleteTemplateModalBtn"),
-  aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"), aiPreviewWrap: document.getElementById("aiPreviewWrap"), aiPreviewList: document.getElementById("aiPreviewList"), aiPreviewActions: document.getElementById("aiPreviewActions"), applyAiPreviewBtn: document.getElementById("applyAiPreviewBtn"), discardAiPreviewBtn: document.getElementById("discardAiPreviewBtn"),
+  aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), openAiModalBtnRoutines: document.getElementById("openAiModalBtnRoutines"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"), aiPreviewWrap: document.getElementById("aiPreviewWrap"), aiPreviewList: document.getElementById("aiPreviewList"), aiPreviewActions: document.getElementById("aiPreviewActions"), applyAiPreviewBtn: document.getElementById("applyAiPreviewBtn"), discardAiPreviewBtn: document.getElementById("discardAiPreviewBtn"),
   workoutNotesWrap: document.getElementById("workoutNotesWrap"), workoutNotesInput: document.getElementById("workoutNotesInput"),
   draftRecoveryDialog: document.getElementById("draftRecoveryDialog"), draftRecoveryText: document.getElementById("draftRecoveryText"), draftRecoveryResume: document.getElementById("draftRecoveryResume"), draftRecoveryDiscard: document.getElementById("draftRecoveryDiscard"),
+  workoutDateDialog: document.getElementById("workoutDateDialog"), workoutDateDialogTitle: document.getElementById("workoutDateDialogTitle"), workoutDateDialogText: document.getElementById("workoutDateDialogText"), workoutDateMoveBtn: document.getElementById("workoutDateMoveBtn"), workoutDateKeepBtn: document.getElementById("workoutDateKeepBtn"), workoutDateCancelBtn: document.getElementById("workoutDateCancelBtn"),
   editWorkoutNameBtn: document.getElementById("editWorkoutNameBtn"),
   editWorkoutFocusBtn: document.getElementById("editWorkoutFocusBtn"),
   themeColorInput: document.getElementById("themeColorInput"),
@@ -46,7 +67,11 @@ const els = {
 
 let currentUser = null; let activeWorkoutRef = null; let autosaveTimer = null; let saveIndicatorTimer = null; let draftRecoveryShownThisSession = false;
 let pendingAiRoutine = null;
+let dateInputManuallySelected = false;
+let workoutDateConfirmation = null;
+let pendingWorkoutDateDecision = null;
 const LOCAL_DRAFT_KEY_PREFIX = "k2_gym_workout_draft_v1:";
+const EXERCISE_PROGRESS_CACHE_KEY_PREFIX = "k2_gym_exercise_progress_v1:";
 const AUTOSAVE_DEBOUNCE_MS = 800;
 const AI_PROMPT_MAX_LENGTH = 600;
 const WORKOUT_FOCUS_OPTIONS = ["Legs", "Chest", "Shoulders", "Back"];
@@ -56,6 +81,40 @@ const APP_THEME_STORAGE_KEY = "k2_app_theme_v1";
 const DEFAULT_APP_THEME_COLOR = "#34d399";
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
+let currentRoute = "home";
+let isFinishingWorkout = false;
+const exerciseProgressCache = new Map();
+const exerciseProgressLoadsStarted = new WeakSet();
+
+function routeFromHash() {
+  const hash = String(window.location.hash || "").replace(/^#/, "").toLowerCase();
+  if (hash === "recent") return "recent";
+  if (hash === "routines") return "routines";
+  return "home";
+}
+
+function setRouteView(route) {
+  currentRoute = route;
+  els.homeView?.classList.toggle("hidden", route !== "home");
+  els.recentView?.classList.toggle("hidden", route !== "recent");
+  els.routinesView?.classList.toggle("hidden", route !== "routines");
+  if (route === "recent" && currentUser) {
+    ensureRecentWorkoutsPageLoaded().catch((e) => {
+      console.error("Recent workouts route load failed", e);
+      renderRecentWorkoutsError("Could not load workouts.");
+    });
+  }
+  if (route === "routines" && currentUser) {
+    loadTemplates().catch((e) => console.error("Routines route load failed", e));
+  }
+}
+
+function handleRouteChange() {
+  setRouteView(routeFromHash());
+}
+
+window.addEventListener("hashchange", handleRouteChange);
+handleRouteChange();
 
 function normalizeThemeHex(value) {
   const hex = String(value || "").trim().toLowerCase();
@@ -150,19 +209,156 @@ applyThemeColor(getStoredThemeColor());
 
 // NEW: Helper to safely format dates in your local timezone, ignoring UTC
 function toLocalISODate(d) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+  return localCalendarDateKey(d);
 }
 
 function todayISO() { 
   return toLocalISODate(new Date()); 
 }
 if (els.dateInput) els.dateInput.value = todayISO();
+
+function selectedWorkoutDate() {
+  return els.dateInput?.value || todayISO();
+}
+
+function setWorkoutDateInput(dateKey, options = {}) {
+  if (els.dateInput && dateKey) els.dateInput.value = dateKey;
+  dateInputManuallySelected = options.manuallySelected === true;
+}
+
+function markWorkoutDateConfirmed(selectedDate, currentDate = todayISO()) {
+  workoutDateConfirmation = {
+    workoutId: activeWorkoutRef?.id || null,
+    selectedDate,
+    currentDate,
+  };
+}
+
+function clearWorkoutDateConfirmation() {
+  workoutDateConfirmation = null;
+}
+
+function dateConfirmationNeeded(selectedDate = selectedWorkoutDate(), currentDate = todayISO()) {
+  return needsWorkoutDateConfirmation({
+    selectedDate,
+    currentDate,
+    confirmedSelectedDate: workoutDateConfirmation?.workoutId === activeWorkoutRef?.id
+      ? workoutDateConfirmation.selectedDate
+      : null,
+    confirmedCurrentDate: workoutDateConfirmation?.workoutId === activeWorkoutRef?.id
+      ? workoutDateConfirmation.currentDate
+      : null,
+  });
+}
+
+function resolveDateForNewWorkout() {
+  const date = resolveNewWorkoutDate({
+    selectedDate: els.dateInput?.value,
+    manuallySelected: dateInputManuallySelected,
+    now: new Date(),
+  });
+  setWorkoutDateInput(date, { manuallySelected: dateInputManuallySelected });
+  clearWorkoutDateConfirmation();
+  return date;
+}
+
+function requestWorkoutDateDecision(selectedDate, currentDate, reason = "resume") {
+  if (selectedDate === currentDate) return Promise.resolve("keep");
+  if (pendingWorkoutDateDecision) return pendingWorkoutDateDecision;
+  const originalLabel = formatCalendarDate(selectedDate);
+  const currentLabel = formatCalendarDate(currentDate);
+  if (!els.workoutDateDialog) {
+    if (confirm(`This workout is dated ${originalLabel}. Move it to ${currentLabel}?`)) return Promise.resolve("move");
+    if (confirm(`Keep this workout on ${originalLabel}? Select Cancel to leave the draft unchanged.`)) return Promise.resolve("keep");
+    return Promise.resolve("cancel");
+  }
+
+  if (els.workoutDateDialogTitle) {
+    els.workoutDateDialogTitle.textContent = reason === "resume" ? "Choose workout date" : "Confirm workout date";
+  }
+  if (els.workoutDateDialogText) {
+    els.workoutDateDialogText.textContent = reason === "resume"
+      ? `This unfinished workout is dated ${originalLabel}. Your current local date is ${currentLabel}. Choose the intended calendar date before continuing.`
+      : `This workout is dated ${originalLabel}, but your current local date is ${currentLabel}. Confirm the intended calendar date before saving.`;
+  }
+  if (els.workoutDateMoveBtn) els.workoutDateMoveBtn.textContent = "Move workout to today";
+  if (els.workoutDateKeepBtn) els.workoutDateKeepBtn.textContent = `Keep ${formatCalendarDate(selectedDate, { includeYear: false })}`;
+
+  pendingWorkoutDateDecision = new Promise((resolve) => {
+    const finish = (choice) => {
+      els.workoutDateMoveBtn?.removeEventListener("click", move);
+      els.workoutDateKeepBtn?.removeEventListener("click", keep);
+      els.workoutDateCancelBtn?.removeEventListener("click", cancel);
+      els.workoutDateDialog?.removeEventListener("cancel", cancelEvent);
+      if (els.workoutDateDialog?.open) els.workoutDateDialog.close();
+      pendingWorkoutDateDecision = null;
+      resolve(choice);
+    };
+    const move = () => finish("move");
+    const keep = () => finish("keep");
+    const cancel = () => finish("cancel");
+    const cancelEvent = (event) => { event.preventDefault(); finish("cancel"); };
+    els.workoutDateMoveBtn?.addEventListener("click", move);
+    els.workoutDateKeepBtn?.addEventListener("click", keep);
+    els.workoutDateCancelBtn?.addEventListener("click", cancel);
+    els.workoutDateDialog?.addEventListener("cancel", cancelEvent);
+    els.workoutDateDialog.showModal();
+  });
+  return pendingWorkoutDateDecision;
+}
+
+async function persistActiveWorkoutDateOnly(dateKey) {
+  if (!activeWorkoutRef || !currentUser) return;
+  setWorkoutDateInput(dateKey, { manuallySelected: true });
+  writeLocalDraftSnapshot();
+  try {
+    await updateDoc(activeWorkoutRef, { date: dateKey, dateKey });
+    setSaveIndicator("Workout date updated", "saved", 2200);
+  } catch (error) {
+    console.warn("Workout date update will retry with draft sync", error);
+    setSaveIndicator("Offline — date choice saved on this device", "offline", 0);
+  }
+}
+
+async function confirmActiveWorkoutDate(reason = "finalize") {
+  if (!activeWorkoutRef) return false;
+  const selectedDate = selectedWorkoutDate();
+  const currentDate = todayISO();
+  if (!dateConfirmationNeeded(selectedDate, currentDate)) return true;
+  const choice = await requestWorkoutDateDecision(selectedDate, currentDate, reason);
+  if (choice === "cancel") return false;
+  const chosenDate = choice === "move" ? currentDate : selectedDate;
+  if (choice === "move") await persistActiveWorkoutDateOnly(chosenDate);
+  markWorkoutDateConfirmed(chosenDate, currentDate);
+  return true;
+}
+
+async function recheckWorkoutDateAfterReturn() {
+  const currentDate = todayISO();
+  if (!activeWorkoutRef) {
+    if (!dateInputManuallySelected && els.dateInput?.value !== currentDate) {
+      setWorkoutDateInput(currentDate, { manuallySelected: false });
+    }
+    return;
+  }
+  if (dateConfirmationNeeded(selectedWorkoutDate(), currentDate)) {
+    await confirmActiveWorkoutDate("focus");
+  }
+}
+
 function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
 function formatTimeDisplay(ms) { return !ms ? "" : new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
-function setStatus(msg, type = "info") { if (els.saveStatus) { els.saveStatus.innerHTML = `<span class="${type === 'error' ? 'text-red-400' : 'text-emerald-400'}">${escapeHtml(msg)}</span>`; setTimeout(() => { els.saveStatus.innerHTML = ""; }, 3000); } }
+function setStatus(msg, type = "info") {
+  if (!els.saveStatus) return;
+  els.saveStatus.innerHTML = `<span class="${type === 'error' ? 'text-red-400' : 'text-emerald-400'}">${escapeHtml(msg)}</span>`;
+  window.setTimeout(() => { els.saveStatus.innerHTML = ""; }, type === "error" ? 8000 : 3000);
+}
+
+function setFinishButtonState({ disabled = false, label = "Finish & Save" } = {}) {
+  if (!els.finishWorkoutBtn) return;
+  els.finishWorkoutBtn.disabled = disabled;
+  els.finishWorkoutBtn.textContent = label;
+}
 
 /** Autosave line next to timer: supports saving / saved / offline (offline stays until next success). */
 function setSaveIndicator(msg, kind = "saved", clearAfterMs = 2200) {
@@ -185,7 +381,7 @@ function setAuthUI() {
   els.signInBtn?.classList.toggle("hidden", signedIn);
   els.signOutBtn?.classList.toggle("hidden", !signedIn);
   if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = !signedIn || !!activeWorkoutRef;
-  if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = !signedIn || !activeWorkoutRef;
+  if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = isFinishingWorkout || !signedIn || !activeWorkoutRef;
 }
 
 function syncFocusUI() {
@@ -201,6 +397,9 @@ function resetWorkoutState(options = {}) {
   workoutState.routineName = "Custom Workout";
   workoutState.focus = [];
   workoutState.notes = "";
+  clearWorkoutDateConfirmation();
+  dateInputManuallySelected = false;
+  setWorkoutDateInput(todayISO(), { manuallySelected: false });
   if (els.workoutNotesInput) els.workoutNotesInput.value = "";
   syncFocusUI();
   if (els.resumeDraftBtn) els.resumeDraftBtn.disabled = true;
@@ -264,11 +463,14 @@ function buildLocalDraftSnapshot() {
   return {
     workoutId: activeWorkoutRef.id,
     updatedAtMs: Date.now(),
-    exercises: JSON.parse(JSON.stringify(workoutState.exercises)),
+    exercises: workoutState.exercises.map(({ progress: _progress, ...exercise }) =>
+      JSON.parse(JSON.stringify(exercise))
+    ),
     routineName: workoutState.routineName,
     focus: [...workoutState.focus],
     templateId: workoutState.templateId,
-    date: els.dateInput?.value || todayISO(),
+    date: selectedWorkoutDate(),
+    dateKey: selectedWorkoutDate(),
     unit: els.unitSelect?.value || "lb",
     notes: workoutState.notes || "",
   };
@@ -315,8 +517,10 @@ async function fetchSortedDraftWorkouts() {
 
 /** Creates a new draft document in Firestore (empty or with exercises); returns the DocumentReference. */
 async function createWorkoutDraftInFirestore(initial = {}) {
+  const intendedDate = initial.dateKey ?? initial.date ?? selectedWorkoutDate();
   const payload = {
-    date: initial.date ?? els.dateInput?.value ?? todayISO(),
+    date: intendedDate,
+    dateKey: intendedDate,
     unit: initial.unit ?? els.unitSelect?.value ?? "lb",
     exercises: initial.exercises ?? [],
     routineName: initial.routineName ?? "Custom Workout",
@@ -375,7 +579,10 @@ function sanitizeDraftExercisesForStorage(exercises) {
 
 /** Persists local snapshot first, then Firestore. On network failure, local copy still has latest edits. */
 async function saveWorkoutDraft() {
-  if (!activeWorkoutRef || !currentUser) return;
+  // Never write status:"draft" while finishing: a late draft write landing after finalizeWorkout
+  // would turn the saved workout back into a draft (and re-trigger the resume prompt).
+  if (!activeWorkoutRef || !currentUser || isFinishingWorkout) return;
+  const draftRef = activeWorkoutRef;
   writeLocalDraftSnapshot();
   setSaveIndicator("Saving…", "saving", 0);
   const payload = {
@@ -384,16 +591,19 @@ async function saveWorkoutDraft() {
     routineName: workoutState.routineName,
     focus: workoutState.focus,
     templateId: workoutState.templateId,
-    date: els.dateInput?.value || todayISO(),
+    date: selectedWorkoutDate(),
+    dateKey: selectedWorkoutDate(),
     unit: els.unitSelect?.value || "lb",
     notes: workoutState.notes || "",
     updatedAtMs: Date.now(),
   };
   try {
-    await setDoc(activeWorkoutRef, payload, { merge: true });
-    setSaveIndicator("Saved", "saved", 2200);
+    await setDoc(draftRef, payload, { merge: true });
+    if (activeWorkoutRef === draftRef) setSaveIndicator("Saved", "saved", 2200);
   } catch (e) {
     console.error("Draft cloud save failed", e);
+    // The workout was finished or replaced while this write was in flight; the error is moot.
+    if (activeWorkoutRef !== draftRef) return;
     const code = String(e?.code || "");
     if (code === "permission-denied" || code === "functions/permission-denied") {
       setSaveIndicator("Save failed — permission denied", "error", 5000);
@@ -413,7 +623,7 @@ function scheduleAutosave() {
 }
 
 /** Apply in-memory state + UI from a draft row (Firestore shape). Re-merges local backup after cloud read so offline edits win when newer. */
-async function loadWorkoutDraft(draftRow) {
+async function loadWorkoutDraft(draftRow, options = {}) {
   if (!currentUser || !draftRow?.id) return;
   const snap = await getDoc(doc(db, "users", currentUser.uid, "workouts", draftRow.id));
   if (!snap.exists() || snap.data().status !== "draft") {
@@ -430,14 +640,17 @@ async function loadWorkoutDraft(draftRow) {
   workoutState.routineName = d.routineName || "Custom Workout";
   workoutState.focus = d.focus || [];
   workoutState.notes = d.notes || "";
-  if (els.dateInput) els.dateInput.value = d.date || todayISO();
+  const restoredDate = options.dateOverride || d.dateKey || d.date || todayISO();
+  setWorkoutDateInput(restoredDate, { manuallySelected: true });
+  if (options.confirmedCurrentDate) markWorkoutDateConfirmed(restoredDate, options.confirmedCurrentDate);
   if (els.unitSelect) els.unitSelect.value = d.unit || "lb";
   if (els.workoutNotesInput) els.workoutNotesInput.value = workoutState.notes;
   syncFocusUI();
   setActiveBadge();
   setAuthUI();
   renderWorkoutBuilder();
-  await saveWorkoutDraft();
+  if (options.dateChoice === "move") await persistActiveWorkoutDateOnly(restoredDate);
+  else await saveWorkoutDraft();
   await updateResumeDraftButtonState();
   setStatus("Workout resumed", "info");
 }
@@ -454,6 +667,7 @@ function mergeLocalDraftIfNewer(cloudDraft, localSnap) {
     templateId: localSnap.templateId,
     notes: localSnap.notes,
     date: localSnap.date,
+    dateKey: localSnap.dateKey || localSnap.date,
     unit: localSnap.unit,
     updatedAtMs: localSnap.updatedAtMs,
   };
@@ -513,7 +727,15 @@ async function discardWorkoutDraft(workoutId = activeWorkoutRef?.id || null) {
 
 /** Finish: same document becomes `final` — no duplicate completed rows. */
 async function completeWorkoutFromDraft() {
-  if (!activeWorkoutRef) return;
+  if (isFinishingWorkout) return;
+  if (!currentUser) {
+    setStatus("Sign in before saving a workout.", "error");
+    return;
+  }
+  if (!activeWorkoutRef) {
+    setStatus("Start or resume a workout before finishing.", "error");
+    return;
+  }
   if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
   const finalExercises = [];
   workoutState.exercises.forEach((ex) => {
@@ -522,7 +744,10 @@ async function completeWorkoutFromDraft() {
       const w = String(s.weight ?? "").trim();
       return r > 0 || w !== "";
     });
-    if (validSets.length > 0) finalExercises.push({ ...ex, sets: validSets });
+    if (validSets.length > 0) {
+      const { progress: _progress, ...finalExercise } = ex;
+      finalExercises.push({ ...finalExercise, sets: validSets });
+    }
   });
   if (finalExercises.length === 0) {
     return setStatus("Add reps (or weight + reps) to at least one set to finish.", "error");
@@ -532,10 +757,19 @@ async function completeWorkoutFromDraft() {
     const timeB = b.firstEditTime || b.addedAt || 0;
     return timeA - timeB;
   });
-  if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = true;
+  setFinishButtonState({ disabled: true, label: "Saving..." });
   setStatus("Finishing...", "info");
+  isFinishingWorkout = true;
   try {
+    if (!await confirmActiveWorkoutDate("finalize")) {
+      setStatus("Workout not saved. Your draft is preserved.", "info");
+      return;
+    }
     writeLocalDraftSnapshot();
+    // Let any autosave already sent reach the server before finalizing so it cannot land afterwards.
+    // Bounded: offline, pending writes never ack and finalize will fail on its own anyway.
+    await Promise.race([waitForPendingWrites(db), new Promise((resolve) => setTimeout(resolve, 5000))]).catch(() => {});
+    const finalizedDate = selectedWorkoutDate();
     const finalizeWorkout = httpsCallable(functions, "finalizeWorkout");
     const finalizationId = `${activeWorkoutRef.id}_${Date.now()}`;
     const response = await finalizeWorkout({
@@ -544,18 +778,18 @@ async function completeWorkoutFromDraft() {
       exercises: finalExercises,
       routineName: workoutState.routineName,
       focus: workoutState.focus,
-      date: els.dateInput?.value || todayISO(),
+      date: finalizedDate,
+      dateKey: finalizedDate,
       unit: els.unitSelect?.value || "lb",
       notes: workoutState.notes || "",
       templateId: workoutState.templateId,
     });
     if (!response?.data?.ok) throw new Error("Finalize did not return success.");
-    invalidateFinalSetsCache();
+    invalidateFinalSetsCache(finalExercises.map((exercise) => exercise.exerciseId));
     resetWorkoutAnalyticsCaches();
-    await runIntegrityCheckIfDue(true);
     clearLocalDraft();
     resetWorkoutState({ clearLocal: false });
-    const savedDate = response.data.workoutDate || (els.dateInput?.value || todayISO());
+    const savedDate = response.data.workoutDate || finalizedDate;
     const verificationWarning = String(response?.data?.verificationWarning || "").trim();
     setStatus(
       verificationWarning
@@ -564,15 +798,31 @@ async function completeWorkoutFromDraft() {
       "info"
     );
     setAuthUI();
-    await updateResumeDraftButtonState();
-    await loadAnalytics();
-    await populateDropdowns();
+    updateResumeDraftButtonState().catch(() => {});
+    loadAnalytics().catch(() => {});
+    populateDropdowns().catch(() => {});
+    refreshRecentWorkoutsPage({ reset: true, renderLoading: false }).catch(() => {});
     scheduleAnalyticsRefresh();
   } catch (e) {
-    console.error(e);
-    setStatus(e?.message || "Finish failed", "error");
+    console.error("Finish workout failed", e);
+    const code = String(e?.code || "").replace(/^functions\//, "");
+    const message = String(e?.message || "").trim();
+    if (code === "failed-precondition" && /already finalized/i.test(message)) {
+      // An earlier attempt went through but its response was lost. The workout is saved; drop the
+      // stale draft state so it is not autosaved back to draft or offered for resume.
+      clearLocalDraft();
+      resetWorkoutState({ clearLocal: false });
+      resetWorkoutAnalyticsCaches();
+      setStatus("This workout was already saved by an earlier attempt.", "info");
+      refreshRecentWorkoutsPage({ reset: true, renderLoading: false }).catch(() => {});
+      loadAnalytics().catch(() => {});
+      return;
+    }
+    setStatus(message || (code ? `Finish failed: ${code}` : "Finish failed"), "error");
   } finally {
-    if (els.finishWorkoutBtn) els.finishWorkoutBtn.disabled = false;
+    isFinishingWorkout = false;
+    setFinishButtonState({ disabled: false, label: "Finish & Save" });
+    setAuthUI();
   }
 }
 
@@ -582,7 +832,20 @@ async function resumeLatestDraft() {
     els.draftRecoveryDialog?.close();
     const row = await resolveDraftRowForResume();
     if (!row) { setStatus("No draft to resume.", "error"); return; }
-    await loadWorkoutDraft(row);
+    const originalDate = row.dateKey || row.date || todayISO();
+    const currentDate = todayISO();
+    let choice = "keep";
+    if (originalDate !== currentDate) choice = await requestWorkoutDateDecision(originalDate, currentDate, "resume");
+    const resolution = applyDraftDateChoice(row, choice, currentDate);
+    if (resolution.cancelled) {
+      setStatus("Draft preserved. Resume it when you are ready.", "info");
+      return;
+    }
+    await loadWorkoutDraft(resolution.draft, {
+      dateOverride: resolution.selectedDate,
+      dateChoice: choice,
+      confirmedCurrentDate: currentDate,
+    });
   } catch (e) {
     console.error(e);
     setStatus("Failed to resume draft", "error");
@@ -602,6 +865,7 @@ async function offerDraftRecoveryIfNeeded() {
   const parts = [];
   if (preview) {
     parts.push(`Last saved: ${new Date(preview.updatedAtMs || Date.now()).toLocaleString()}`);
+    parts.push(`Workout date: ${formatCalendarDate(preview.dateKey || preview.date)}.`);
     parts.push(`${(preview.exercises || []).length} exercise(s) in cloud draft.`);
   }
   if (draftHasMeaningfulProgress(localSnap) && localSnap?.workoutId) parts.push("A backup exists on this device (used if it is newer).");
@@ -621,8 +885,15 @@ document.querySelectorAll('input[name="workoutFocus"]').forEach(cb => {
     scheduleAutosave();
   });
 });
-els.dateInput?.addEventListener("change", () => scheduleAutosave());
-els.unitSelect?.addEventListener("change", () => scheduleAutosave());
+els.dateInput?.addEventListener("change", () => {
+  dateInputManuallySelected = true;
+  clearWorkoutDateConfirmation();
+  scheduleAutosave();
+});
+els.unitSelect?.addEventListener("change", () => {
+  renderAllSetComparisons();
+  scheduleAutosave();
+});
 els.workoutNotesInput?.addEventListener("input", () => {
   workoutState.notes = els.workoutNotesInput.value;
   scheduleAutosave();
@@ -653,6 +924,11 @@ els.draftRecoveryDiscard?.addEventListener("click", async () => {
 
 window.addEventListener("online", () => {
   if (activeWorkoutRef && currentUser) saveWorkoutDraft().catch(() => {});
+  workoutState.exercises.forEach((exercise) => {
+    if (exercise.progress?.status === "offline" || exercise.progress?.status === "error") {
+      ensureExerciseProgressLoaded(exercise, { force: true }).catch(() => {});
+    }
+  });
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -660,6 +936,8 @@ document.addEventListener("visibilitychange", () => {
     if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
     writeLocalDraftSnapshot();
     saveWorkoutDraft().catch(() => {});
+  } else if (document.visibilityState === "visible") {
+    recheckWorkoutDateAfterReturn().catch((error) => console.warn("Workout date recheck failed", error));
   }
 });
 
@@ -739,7 +1017,11 @@ function isExerciseFavorite(exerciseId) {
 
 /** Ensure each exercise row has exerciseNote for older saved workouts. */
 function normalizeWorkoutExercisesArray(arr) {
-  return (arr || []).map(ex => ({ ...ex, exerciseNote: ex.exerciseNote != null ? String(ex.exerciseNote) : "" }));
+  return (arr || []).map(ex => ({
+    ...ex,
+    exerciseNote: ex.exerciseNote != null ? String(ex.exerciseNote) : "",
+    lastSets: (Array.isArray(ex.lastSets) ? ex.lastSets : []).filter(isCompletedSet),
+  }));
 }
 
 window.addEventListener("beforeunload", () => {
@@ -749,7 +1031,49 @@ window.addEventListener("beforeunload", () => {
 });
 
 // ==================== AUTH ====================
-els.signInBtn?.addEventListener("click", async () => { try { await signInWithPopup(auth, new GoogleAuthProvider()); } catch (e) { console.error("FIREBASE AUTH ERROR:", e); setStatus("Sign-in failed.", "error"); } });
+function formatAuthError(error) {
+  const code = String(error?.code || "").replace(/^auth\//, "");
+  if (code === "unauthorized-domain") return "Sign-in failed: this domain is not authorized in Firebase Auth.";
+  if (code === "popup-blocked") return "Popup was blocked. Redirecting to Google sign-in...";
+  if (code === "popup-closed-by-user" || code === "cancelled-popup-request") return "Popup closed. Redirecting to Google sign-in...";
+  return `Sign-in failed${code ? `: ${code}` : "."}`;
+}
+
+async function startGoogleSignIn() {
+  if (!els.signInBtn) return;
+  els.signInBtn.disabled = true;
+  setStatus("Opening Google sign-in...", "info");
+  try {
+    await signInWithPopup(auth, googleProvider);
+  } catch (error) {
+    console.error("FIREBASE AUTH ERROR:", {
+      code: error?.code || null,
+      message: error?.message || String(error),
+    });
+    setStatus(formatAuthError(error), "error");
+    const code = String(error?.code || "");
+    if (
+      code === "auth/popup-blocked" ||
+      code === "auth/popup-closed-by-user" ||
+      code === "auth/cancelled-popup-request"
+    ) {
+      await signInWithRedirect(auth, googleProvider);
+      return;
+    }
+  } finally {
+    els.signInBtn.disabled = false;
+  }
+}
+
+getRedirectResult(auth).catch((error) => {
+  console.error("FIREBASE AUTH REDIRECT ERROR:", {
+    code: error?.code || null,
+    message: error?.message || String(error),
+  });
+  setStatus(formatAuthError(error), "error");
+});
+
+els.signInBtn?.addEventListener("click", () => startGoogleSignIn());
 els.signOutBtn?.addEventListener("click", () => signOut(auth));
 
 async function runBootstrapStep(label, task) {
@@ -771,9 +1095,12 @@ onAuthStateChanged(auth, async (user) => {
   if (!currentUser) {
     favoriteExerciseIdSet = new Set();
     resetWorkoutAnalyticsCaches();
+    resetRecentWorkoutsState();
     resetWorkoutState({ clearLocal: false });
     setAuthUI();
     if (els.templatesList) els.templatesList.innerHTML = `<div class="text-zinc-500 text-sm">Sign in to see routines.</div>`;
+    renderRecentWorkoutsSignedOut();
+    handleRouteChange();
     return;
   }
   await runBootstrapStep("lastSeen", () =>
@@ -790,6 +1117,7 @@ onAuthStateChanged(auth, async (user) => {
   await runBootstrapStep("dropdowns", () => populateDropdowns());
   await runBootstrapStep("resume button", () => updateResumeDraftButtonState());
   await runBootstrapStep("draft recovery", () => offerDraftRecoveryIfNeeded());
+  handleRouteChange();
   if (els.searchInput && !normalizeSearchText(els.searchInput.value)) {
     await runBootstrapStep("search bootstrap", () => searchExercises(""));
   }
@@ -1028,6 +1356,53 @@ async function renderFavoritesSectionOnly() {
 
 els.searchBtn?.addEventListener("click", () => searchExercises(els.searchInput.value));
 els.searchInput?.addEventListener("keydown", e => e.key === "Enter" && searchExercises(els.searchInput.value));
+els.createCustomExerciseBtn?.addEventListener("click", () => promptCreateCustomExercise());
+
+async function saveCustomExerciseByName(name, { addToActiveWorkout = true } = {}) {
+  if (!currentUser) {
+    setStatus("Sign in to create custom exercises.", "error");
+    return null;
+  }
+  const cleanName = String(name || "").trim();
+  const nameLower = normalizeSearchText(cleanName);
+  if (!cleanName || !nameLower) {
+    setStatus("Enter an exercise name first.", "error");
+    return null;
+  }
+
+  const existingSnap = await getDocs(
+    query(collection(db, "users", currentUser.uid, "custom_exercises"), where("nameLower", "==", nameLower), limit(1))
+  );
+  const existing = existingSnap.empty ? null : { id: existingSnap.docs[0].id, ...existingSnap.docs[0].data() };
+  const exercise = existing || {
+    id: (await addDoc(collection(db, "users", currentUser.uid, "custom_exercises"), {
+      name: cleanName.slice(0, 120),
+      nameLower,
+      createdAt: serverTimestamp(),
+    })).id,
+    name: cleanName.slice(0, 120),
+  };
+
+  if (addToActiveWorkout && activeWorkoutRef) {
+    addExerciseToWorkout(exercise.id, exercise.name || cleanName);
+  }
+  if (els.searchInput) els.searchInput.value = exercise.name || cleanName;
+  await searchExercises(exercise.name || cleanName);
+  setStatus(existing ? "Custom exercise already exists." : "Custom exercise saved.", "info");
+  return exercise;
+}
+
+async function promptCreateCustomExercise() {
+  const suggested = String(els.searchInput?.value || "").trim();
+  const name = prompt("Custom exercise name", suggested);
+  if (!name || !name.trim()) return;
+  try {
+    await saveCustomExerciseByName(name, { addToActiveWorkout: true });
+  } catch (e) {
+    console.error("Custom exercise creation failed", e);
+    setStatus("Failed to create custom exercise.", "error");
+  }
+}
 
 async function searchExercises(term) {
   if (!els.searchResults || !currentUser) return;
@@ -1089,9 +1464,7 @@ async function searchExercises(term) {
       `;
       document.getElementById("addCustomExBtn").onclick = async () => {
         try {
-          const newRef = await addDoc(collection(db, "users", currentUser.uid, "custom_exercises"), { name: term, nameLower: t, createdAt: serverTimestamp() });
-          addExerciseToWorkout(newRef.id, term);
-          els.searchResults.innerHTML = `<div class="text-emerald-400 text-sm">Saved to personal library!</div>`; els.searchInput.value = "";
+          await saveCustomExerciseByName(term, { addToActiveWorkout: true });
         } catch(e) { setStatus("Failed to save custom exercise.", "error"); }
       };
       return;
@@ -1138,12 +1511,6 @@ function addExerciseToWorkout(id, name) {
   const exerciseEntry = { exerciseId: id, name, exerciseNote: "", sets: [{weight:"", reps:"", rpe:""}], lastSets: [], addedAt: Date.now(), firstEditTime: null, lastEditTime: null };
   workoutState.exercises.push(exerciseEntry);
   renderWorkoutBuilder(); populateDropdowns(); scheduleAutosave();
-  fetchLastFinalSetsForExerciseSafe(id).then(ls => {
-    if (!workoutState.exercises.includes(exerciseEntry)) return;
-    exerciseEntry.lastSets = ls;
-    renderWorkoutBuilder();
-    scheduleAutosave();
-  });
 }
 
 async function findOrCreateExerciseId(name) {
@@ -1190,36 +1557,329 @@ async function resolveExerciseIdForAi(name, index) {
 }
 
 /** Clears cached “last sets” reads and chart workout sample after workout/PR changes. */
-function invalidateFinalSetsCache() {
+function exerciseProgressStorageKey(uid, exerciseId) {
+  return uid && exerciseId ? `${EXERCISE_PROGRESS_CACHE_KEY_PREFIX}${uid}:${encodeURIComponent(exerciseId)}` : null;
+}
+
+function readLocalExerciseProgress(exerciseId) {
+  const key = exerciseProgressStorageKey(currentUser?.uid, exerciseId);
+  if (!key) return null;
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || "null");
+    const sessions = normalizeCachedExerciseSessions(stored?.sessions, 5, isCompletedSet);
+    if (!sessions.length) return null;
+    return {
+      sessions,
+      pr: stored?.pr && typeof stored.pr === "object" ? stored.pr : null,
+      exerciseNote: String(stored?.exerciseNote || sessions[0]?.exerciseNote || "").slice(0, 500),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeLocalExerciseProgress(exerciseId, progress) {
+  const key = exerciseProgressStorageKey(currentUser?.uid, exerciseId);
+  const sessions = normalizeCachedExerciseSessions(progress?.sessions, 5, isCompletedSet);
+  if (!key || !sessions.length) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({
+      sessions,
+      pr: progress?.pr || null,
+      exerciseNote: String(progress?.exerciseNote || sessions[0]?.exerciseNote || "").slice(0, 500),
+      cachedAtMs: Date.now(),
+    }));
+  } catch (_) { /* storage unavailable */ }
+}
+
+function clearLocalExerciseProgress(exerciseIds) {
+  (Array.isArray(exerciseIds) ? exerciseIds : []).forEach((exerciseId) => {
+    const key = exerciseProgressStorageKey(currentUser?.uid, exerciseId);
+    if (!key) return;
+    try { localStorage.removeItem(key); } catch (_) { /* storage unavailable */ }
+  });
+}
+
+function hydrateExerciseProgressReference(exercise) {
+  const existingSessions = normalizeCachedExerciseSessions(exercise?.progress?.sessions, 5, isCompletedSet);
+  const localProgress = existingSessions.length ? null : readLocalExerciseProgress(exercise?.exerciseId);
+  const sessions = existingSessions.length ? existingSessions : (localProgress?.sessions || []);
+  exercise.lastSets = sessions[0]?.sets || [];
+  if (sessions.length) {
+    exercise.progress = {
+      status: navigator.onLine === false ? "offline" : (exercise.progress?.status || "loading"),
+      sessions,
+      pr: exercise.progress?.pr || localProgress?.pr || null,
+      exerciseNote: exercise.progress?.exerciseNote || localProgress?.exerciseNote || "",
+    };
+  }
+}
+
+function invalidateFinalSetsCache(exerciseIds = []) {
   chartWorkoutsSample = [];
   chartWorkoutsLoadPromise = null;
+  exerciseProgressCache.clear();
+  clearLocalExerciseProgress(exerciseIds);
 }
 
 async function fetchLastFinalSetsForExerciseSafe(exerciseId) {
-  if (!currentUser || !exerciseId) return [];
+  const context = await fetchLastExerciseContextSafe(exerciseId);
+  return context.sets;
+}
+
+async function fetchLastExerciseContextSafe(exerciseId) {
+  const fallback = { sets: [], exerciseNote: "" };
+  if (!currentUser || !exerciseId) return fallback;
   try {
-    const r = await getDoc(doc(db, "users", currentUser.uid, "exercise_last_sets", exerciseId));
-    if (r.exists()) {
-      const sets = r.data()?.sets;
-      if (Array.isArray(sets) && sets.length) return sets;
-    }
-  } catch (_) { /* offline */ }
-  try {
-    const q = query(
-      collection(db, "users", currentUser.uid, "workouts"),
-      where("status", "==", "final"),
-      orderBy("updatedAtMs", "desc"),
-      limit(45)
-    );
-    const snap = await getDocs(q);
-    for (const d of snap.docs) {
-      const w = d.data();
-      for (const ex of w.exercises || []) {
-        if (ex.exerciseId === exerciseId && ex?.sets?.length) return ex.sets;
+    const progress = await fetchExerciseProgress(exerciseId);
+    return {
+      sets: progress.sessions?.[0]?.sets || [],
+      exerciseNote: String(progress.exerciseNote || "").slice(0, 500),
+    };
+  } catch (_) { /* offline with no validated cache */ }
+  return fallback;
+}
+
+function findExerciseCard(exerciseId) {
+  return [...(els.workoutExercises?.querySelectorAll("[data-exercise-id]") || [])]
+    .find((card) => card.dataset.exerciseId === exerciseId) || null;
+}
+
+function formatProgressSet(set, unit) {
+  const weight = String(set?.weight ?? "").trim() || "0";
+  const reps = String(set?.reps ?? "").trim() || "0";
+  return `${escapeHtml(weight)} ${escapeHtml(unit)} × ${escapeHtml(reps)}`;
+}
+
+function bestProgressSet(progress) {
+  if (progress?.pr && Number(progress.pr.reps) > 0) {
+    return { set: progress.pr, unit: progress.pr.unit === "kg" ? "kg" : "lb" };
+  }
+  const currentUnit = els.unitSelect?.value || "lb";
+  const candidates = (progress?.sessions || []).flatMap((session) =>
+    session.unit === currentUnit
+      ? filterScorableSets(session.sets).map((set) => ({ set, unit: session.unit }))
+      : []
+  );
+  if (!candidates.length) return null;
+  return candidates.reduce((best, candidate) =>
+    isNewPRBeatsCurrent(candidate.set, best.set) ? candidate : best
+  );
+}
+
+function exerciseProgressHtml(exercise) {
+  const progress = exercise.progress || { status: "loading", sessions: [] };
+  const sessions = progress.sessions || [];
+  const stateMessage = progressStateMessage(progress.status, sessions.length);
+  if (!sessions.length) {
+    const retry = progress.status === "offline" || progress.status === "error"
+      ? `<button type="button" class="retry-progress mt-2 text-xs font-semibold text-emerald-400 hover:text-emerald-300">Retry</button>`
+      : "";
+    return `<div class="exercise-progress rounded-xl border border-zinc-700 bg-zinc-950/60 px-4 py-3 mb-4 text-sm text-zinc-400">${escapeHtml(stateMessage)}${retry}</div>`;
+  }
+
+  const latest = sessions[0];
+  const best = bestProgressSet(progress);
+  const warning = stateMessage
+    ? `<div class="mb-2 text-xs ${progress.status === "offline" ? "text-amber-300" : "text-red-300"}">${escapeHtml(stateMessage)}</div>`
+    : "";
+  const latestSets = latest.sets.map((set, index) =>
+    `<div class="flex justify-between gap-3"><span class="text-zinc-500">Set ${index + 1}</span><span class="font-medium text-zinc-200">${formatProgressSet(set, latest.unit)}</span></div>`
+  ).join("");
+  const history = sessions.map((session) => `
+    <div class="border-t border-zinc-800 py-2 first:border-t-0 first:pt-0">
+      <div class="mb-1 text-xs font-semibold text-zinc-300">${escapeHtml(formatCalendarDate(session.date))}</div>
+      <div class="text-xs text-zinc-500">${session.sets.map((set) => formatProgressSet(set, session.unit)).join(" · ")}</div>
+    </div>`).join("");
+  return `<section class="exercise-progress rounded-xl border border-zinc-700 bg-zinc-950/60 px-4 py-3 mb-4" aria-label="Previous performance for ${escapeHtml(exercise.name)}">
+    ${warning}
+    <div class="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+      <div class="text-sm font-semibold text-zinc-200">Last time — ${escapeHtml(formatCalendarDate(latest.date, { includeYear: false }))}</div>
+      ${best ? `<div class="text-xs font-semibold text-amber-300">Best: ${formatProgressSet(best.set, best.unit)}</div>` : ""}
+    </div>
+    <div class="space-y-1 text-xs">${latestSets}</div>
+    <details class="mt-3 border-t border-zinc-800 pt-2">
+      <summary class="cursor-pointer select-none text-xs font-semibold text-emerald-400">Recent history (${sessions.length})</summary>
+      <div class="mt-2">${history}</div>
+    </details>
+  </section>`;
+}
+
+function comparisonDirectionHtml(label, value) {
+  const presentation = {
+    increased: { symbol: "↑", text: "increased", className: "text-emerald-400" },
+    same: { symbol: "=", text: "same", className: "text-zinc-400" },
+    decreased: { symbol: "↓", text: "decreased", className: "text-amber-300" },
+  }[value];
+  if (!presentation) return "";
+  return `<span class="${presentation.className}">${escapeHtml(label)} ${presentation.symbol} ${presentation.text}</span>`;
+}
+
+function setComparisonHtml(exercise, setIndex) {
+  const previousSession = exercise.progress?.sessions?.[0];
+  const previousSet = previousSession?.sets?.[setIndex];
+  if (!previousSet) return "";
+  const currentUnit = els.unitSelect?.value || "lb";
+  if (previousSession.unit !== currentUnit) {
+    return `<span class="text-zinc-500">Previous set used ${escapeHtml(previousSession.unit)}; comparison unavailable.</span>`;
+  }
+  const comparison = compareSetPerformance(exercise.sets[setIndex], previousSet, prSetVolume);
+  if (!comparison.comparable) return `<span class="text-zinc-500">Compared with ${formatProgressSet(previousSet, previousSession.unit)}</span>`;
+  return [
+    comparisonDirectionHtml("Weight", comparison.weight),
+    comparisonDirectionHtml("Reps", comparison.reps),
+    comparisonDirectionHtml("Score", comparison.score),
+  ].filter(Boolean).join(`<span class="text-zinc-700"> · </span>`);
+}
+
+function updateSetComparisonRow(card, exercise, setIndex) {
+  const target = [...card.querySelectorAll("[data-comparison-idx]")]
+    .find((row) => Number(row.dataset.comparisonIdx) === setIndex);
+  if (target) target.innerHTML = setComparisonHtml(exercise, setIndex);
+}
+
+function updateExerciseSetPlaceholders(card, exercise) {
+  card.querySelectorAll("[data-idx]").forEach((row) => {
+    const setIndex = Number(row.dataset.idx);
+    const weightInput = row.querySelector(".w");
+    const repsInput = row.querySelector(".r");
+    if (weightInput) weightInput.placeholder = previousSetPlaceholder(exercise.lastSets, setIndex, "weight");
+    if (repsInput) repsInput.placeholder = previousSetPlaceholder(exercise.lastSets, setIndex, "reps");
+  });
+}
+
+function renderAllSetComparisons() {
+  workoutState.exercises.forEach((exercise) => updateExerciseProgressPanel(exercise));
+}
+
+function updateExerciseProgressPanel(exercise) {
+  const card = findExerciseCard(exercise.exerciseId);
+  const panel = card?.querySelector(".exercise-progress");
+  if (!card || !panel) return;
+  panel.outerHTML = exerciseProgressHtml(exercise);
+  card.querySelector(".retry-progress")?.addEventListener("click", () => ensureExerciseProgressLoaded(exercise, { force: true }));
+  updateExerciseSetPlaceholders(card, exercise);
+  exercise.sets.forEach((_set, index) => updateSetComparisonRow(card, exercise, index));
+}
+
+async function fetchExerciseProgress(exerciseId) {
+  const cacheKey = `${currentUser?.uid || "signed-out"}:${exerciseId}`;
+  if (exerciseProgressCache.has(cacheKey)) return exerciseProgressCache.get(cacheKey);
+  const request = (async () => {
+    const localProgress = readLocalExerciseProgress(exerciseId);
+    const fetchFinalizedSessions = async () => {
+      const workouts = [];
+      let cursor = null;
+      while (true) {
+        const constraints = [
+          where("status", "==", "final"),
+          orderBy("updatedAtMs", "desc"),
+          limit(50),
+        ];
+        if (cursor) constraints.push(startAfter(cursor));
+        const snap = await getDocs(query(
+          collection(db, "users", currentUser.uid, "workouts"),
+          ...constraints
+        ));
+        workouts.push(...snap.docs.map((workoutSnap) => ({ id: workoutSnap.id, ...workoutSnap.data() })));
+        const sessions = selectPreviousExerciseSessions(
+          workouts,
+          exerciseId,
+          activeWorkoutRef?.id || null,
+          5,
+          isCompletedSet,
+          completedExerciseSetRows
+        );
+        if (sessions.length >= 5 || snap.size < 50) return sessions;
+        cursor = snap.docs[snap.docs.length - 1];
       }
+    };
+    const [historyResult, lastSetsResult, prResult] = await Promise.allSettled([
+      fetchFinalizedSessions(),
+      getDoc(doc(db, "users", currentUser.uid, "exercise_last_sets", exerciseId)),
+      getDoc(doc(db, "users", currentUser.uid, "prs", exerciseId)),
+    ]);
+    const lastData = lastSetsResult.status === "fulfilled" && lastSetsResult.value.exists()
+      ? lastSetsResult.value.data()
+      : null;
+    const derivedSessions = lastData &&
+      lastData.sourceExerciseCompleted === true &&
+      (lastData.unit === "lb" || lastData.unit === "kg") &&
+      lastData.sourceWorkoutId !== activeWorkoutRef?.id
+      ? normalizeCachedExerciseSessions([{
+        workoutId: lastData.sourceWorkoutId || "last-sets-cache",
+        date: lastData.sourceWorkoutDate || "",
+        unit: lastData.unit,
+        exerciseNote: String(lastData.exerciseNote || "").slice(0, 500),
+        sets: lastData.sets,
+        updatedAtMs: Number(lastData.updatedAtMs) || 0,
+      }], 1, isCompletedSet)
+      : [];
+    const historyUnavailable = historyResult.status === "rejected" || navigator.onLine === false;
+    const sessions = historyUnavailable
+      ? normalizeCachedExerciseSessions([
+        ...(historyResult.status === "fulfilled" ? historyResult.value : []),
+        ...derivedSessions,
+        ...(localProgress?.sessions || []),
+      ], 5, isCompletedSet)
+      : historyResult.value;
+    const latestSession = sessions[0] || null;
+    const pr = prResult.status === "fulfilled" && prResult.value.exists()
+      ? prResult.value.data()
+      : localProgress?.pr || null;
+    const exerciseNote = latestSession?.exerciseNote || (
+      lastData?.sourceWorkoutId === latestSession?.workoutId ? String(lastData.exerciseNote || "").slice(0, 500) : ""
+    ) || String(localProgress?.exerciseNote || "").slice(0, 500);
+    const progress = {
+      status: historyUnavailable ? (navigator.onLine === false ? "offline" : "error") : "ready",
+      sessions,
+      pr,
+      exerciseNote,
+    };
+    if (sessions.length) writeLocalExerciseProgress(exerciseId, progress);
+    else if (!historyUnavailable) clearLocalExerciseProgress([exerciseId]);
+    return progress;
+  })();
+  exerciseProgressCache.set(cacheKey, request);
+  return request;
+}
+
+async function ensureExerciseProgressLoaded(exercise, options = {}) {
+  if (!currentUser || !exercise?.exerciseId) return;
+  const cacheKey = `${currentUser.uid}:${exercise.exerciseId}`;
+  if (options.force) exerciseProgressCache.delete(cacheKey);
+  const localProgress = readLocalExerciseProgress(exercise.exerciseId);
+  const initialSessions = normalizeCachedExerciseSessions([
+    ...(exercise.progress?.sessions || []),
+    ...(localProgress?.sessions || []),
+  ], 5, isCompletedSet);
+  exercise.progress = {
+    status: navigator.onLine === false && initialSessions.length ? "offline" : "loading",
+    sessions: initialSessions,
+    pr: exercise.progress?.pr || localProgress?.pr || null,
+    exerciseNote: exercise.progress?.exerciseNote || localProgress?.exerciseNote || "",
+  };
+  exercise.lastSets = initialSessions[0]?.sets || (exercise.lastSets || []).filter(isCompletedSet);
+  updateExerciseProgressPanel(exercise);
+  try {
+    const progress = await fetchExerciseProgress(exercise.exerciseId);
+    if (!workoutState.exercises.includes(exercise)) return;
+    exercise.progress = progress;
+    exercise.lastSets = progress.sessions?.[0]?.sets || [];
+    if (!exercise.exerciseNote && progress.exerciseNote) {
+      exercise.exerciseNote = progress.exerciseNote;
+      const card = findExerciseCard(exercise.exerciseId);
+      const note = card?.querySelector(".exercise-note-input");
+      if (note && !note.value) note.value = progress.exerciseNote;
+      scheduleAutosave();
     }
-  } catch (_) { /* missing composite index until deployed */ }
-  return [];
+    updateExerciseProgressPanel(exercise);
+  } catch (error) {
+    console.warn("Exercise progress load failed", error);
+    exercise.progress = { status: navigator.onLine === false ? "offline" : "error", sessions: [] };
+    exerciseProgressCache.delete(cacheKey);
+    updateExerciseProgressPanel(exercise);
+  }
 }
 
 // ==================== SECURE AI GENERATOR ====================
@@ -1272,15 +1932,16 @@ async function applyPendingAiRoutine() {
     const newExercises = [];
     for (const [index, aiEx] of pendingAiRoutine.exercises.entries()) {
       const dbMatch = await resolveExerciseIdForAi(aiEx.name, index);
+      const lastContext = await fetchLastExerciseContextSafe(dbMatch.id);
       const generatedSets = [];
       const numSets = Number(aiEx.sets) || 3;
       for (let i = 0; i < numSets; i++) generatedSets.push({ weight: "", reps: String(aiEx.reps || "10"), rpe: "" });
       newExercises.push({
         exerciseId: dbMatch.id,
         name: dbMatch.name,
-        exerciseNote: "",
+        exerciseNote: lastContext.exerciseNote,
         sets: generatedSets,
-        lastSets: await fetchLastFinalSetsForExerciseSafe(dbMatch.id),
+        lastSets: lastContext.sets,
         addedAt: Date.now(),
         firstEditTime: null,
         lastEditTime: null,
@@ -1289,9 +1950,11 @@ async function applyPendingAiRoutine() {
 
     let targetWorkoutRef = activeWorkoutRef;
     if (!targetWorkoutRef) {
+      const workoutDate = resolveDateForNewWorkout();
       targetWorkoutRef = await createWorkoutDraftInFirestore({
         exercises: [],
-        date: todayISO(),
+        date: workoutDate,
+        dateKey: workoutDate,
         unit: els.unitSelect?.value || "lb",
       });
     }
@@ -1323,12 +1986,14 @@ async function applyPendingAiRoutine() {
   }
 }
 
-els.openAiModalBtn?.addEventListener("click", () => {
+function openAiRoutineModal() {
   if (!currentUser) return alert("Please sign in to use the AI Generator.");
   clearAiError();
   clearAiPreview();
   els.aiModal?.showModal();
-});
+}
+els.openAiModalBtn?.addEventListener("click", openAiRoutineModal);
+els.openAiModalBtnRoutines?.addEventListener("click", openAiRoutineModal);
 els.closeAiModalBtn?.addEventListener("click", () => { clearAiError(); clearAiPreview(); els.aiModal?.close(); });
 
 els.generateAiBtn?.addEventListener("click", async () => {
@@ -1394,7 +2059,10 @@ async function loadTemplates() {
             div.querySelector(".startTemplateBtn").onclick = () => startWorkoutFromTemplate(d.id, template); div.querySelector(".editTemplateBtn").onclick = () => openTemplateEditModal(d.id, template);
             els.templatesList.appendChild(div);
         });
-    } catch (e) {}
+    } catch (e) {
+        console.error("Failed to load routines", e);
+        els.templatesList.innerHTML = `<div class="text-red-400 rounded-xl border border-red-500/20 bg-red-500/5 py-6 px-4 text-center text-sm">Could not load routines.</div>`;
+    }
 }
 
 function openTemplateEditModal(id, template) { currentEditTemplateId = id; els.editTemplateName.value = template.name; currentEditTemplateExercises = [...(template.exercises || [])]; renderEditTemplateExercises(); els.templateModal.showModal(); }
@@ -1437,12 +2105,14 @@ async function startWorkoutFromTemplate(templateId, template) {
         setStatus("Starting Routine...");
         if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = true;
         if (activeWorkoutRef) { await deleteDoc(activeWorkoutRef); clearLocalDraft(); }
+        const workoutDate = resolveDateForNewWorkout();
         const newExercises = template.exercises.map(ex => ({ exerciseId: ex.exerciseId, name: ex.name, exerciseNote: "", sets: [{weight: "", reps: "", rpe: ""}], lastSets: [], addedAt: Date.now(), firstEditTime: null, lastEditTime: null }));
         activeWorkoutRef = await createWorkoutDraftInFirestore({
           exercises: newExercises,
           templateId,
           routineName: template.name,
-          date: els.dateInput?.value || todayISO(),
+          date: workoutDate,
+          dateKey: workoutDate,
           unit: els.unitSelect?.value || "lb",
         });
         workoutState.exercises = newExercises;
@@ -1455,15 +2125,14 @@ async function startWorkoutFromTemplate(templateId, template) {
         setActiveBadge();
         setAuthUI();
         renderWorkoutBuilder();
-        await Promise.all(
-          workoutState.exercises.map(async (ex) => {
-            ex.lastSets = await fetchLastFinalSetsForExerciseSafe(ex.exerciseId);
-          })
-        );
-        renderWorkoutBuilder();
         await saveWorkoutDraft();
         await updateResumeDraftButtonState();
         setStatus("Routine started ✓");
+        if (currentRoute === "routines") {
+          history.pushState(null, "", "index.html");
+          handleRouteChange();
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }
     } catch (e) { setStatus("Failed to start routine.", "error"); } finally { if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = false; }
 }
 
@@ -1474,9 +2143,11 @@ els.startWorkoutBtn?.addEventListener("click", async () => {
     suppressDraftRecoveryForNewStart();
     setStatus("Starting...");
     els.startWorkoutBtn.disabled = true;
+    const workoutDate = resolveDateForNewWorkout();
     activeWorkoutRef = await createWorkoutDraftInFirestore({
       exercises: [],
-      date: els.dateInput?.value || todayISO(),
+      date: workoutDate,
+      dateKey: workoutDate,
       unit: els.unitSelect?.value || "lb",
       routineName: "Custom Workout",
     });
@@ -1501,6 +2172,10 @@ els.startWorkoutBtn?.addEventListener("click", async () => {
 });
 
 els.finishWorkoutBtn?.addEventListener("click", () => completeWorkoutFromDraft());
+els.loadMoreWorkoutsBtn?.addEventListener("click", () => refreshRecentWorkoutsPage({ reset: false, renderLoading: false }).catch((e) => {
+  console.error("Load more workouts failed", e);
+  renderRecentWorkoutsError("Could not load more workouts.");
+}));
 
 function renderWorkoutBuilder() {
   if (!els.workoutExercises) return; els.workoutExercises.innerHTML = "";
@@ -1509,16 +2184,20 @@ function renderWorkoutBuilder() {
   if (!workoutState.exercises.length) { els.workoutExercises.innerHTML = `<div class="text-zinc-500 text-center py-8">Search and add an exercise to begin tracking.</div>`; return; }
 
   workoutState.exercises.forEach((ex, exIndex) => {
+    hydrateExerciseProgressReference(ex);
     const card = document.createElement("div"); card.className = "bg-zinc-900 border border-zinc-700 rounded-2xl p-5 mb-4";
+    card.dataset.exerciseId = ex.exerciseId;
     function trackTime() { if (!ex.firstEditTime) ex.firstEditTime = Date.now(); ex.lastEditTime = Date.now(); }
     const setsHtml = ex.sets.map((s, idx) => {
-      const last = ex.lastSets?.[idx] || null; const phW = last ? `Last: ${last.weight}` : "0"; const phR = last ? `Last: ${last.reps}` : "0";
+      const phW = previousSetPlaceholder(ex.lastSets, idx, "weight");
+      const phR = previousSetPlaceholder(ex.lastSets, idx, "reps");
       return `
-        <div class="flex items-end gap-3 bg-zinc-800 p-4 rounded-xl border border-zinc-700 mb-3" data-idx="${idx}">
+        <div class="flex flex-wrap items-end gap-3 bg-zinc-800 p-4 rounded-xl border border-zinc-700 mb-3" data-idx="${idx}">
           <div class="flex-1"><label class="block text-xs text-zinc-400 mb-1">Set ${idx + 1} - Weight</label><input class="w w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500" type="number" step="0.5" value="${escapeHtml(s.weight)}" placeholder="${escapeHtml(phW)}"></div>
           <div class="flex-1"><label class="block text-xs text-zinc-400 mb-1">Reps</label><input class="r w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500" type="text" value="${escapeHtml(s.reps)}" placeholder="${escapeHtml(phR)}"></div>
           <div class="flex-1 hidden md:block"><label class="block text-xs text-zinc-400 mb-1">RPE</label><input class="p w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500" type="number" step="0.5" value="${escapeHtml(s.rpe)}" placeholder="-"></div>
           <button class="rem px-3 py-2 text-red-400 hover:text-red-300 transition-colors"><i class="fa-solid fa-trash"></i></button>
+          <div class="set-comparison w-full text-[11px] leading-relaxed" data-comparison-idx="${idx}">${setComparisonHtml(ex, idx)}</div>
         </div>`;
     }).join("");
     if (ex.exerciseNote == null) ex.exerciseNote = "";
@@ -1529,7 +2208,7 @@ function renderWorkoutBuilder() {
     </div>
     <label class="block text-xs text-zinc-500 mb-1">Notes</label>
     <textarea class="exercise-note-input w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500 resize-y min-h-[60px] mb-4" rows="2" placeholder="Add note for this exercise">${escapeHtml(ex.exerciseNote)}</textarea>
-    <div class="flex gap-2 mb-4"><button class="addSet bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">+ Add Set</button><button class="copyLast bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">Copy Last</button><button class="removeExercise text-red-400 hover:text-red-300 px-4 py-2 text-sm ml-auto">Remove</button></div><div>${setsHtml}</div>`;
+    <div class="flex flex-wrap gap-2 mb-4"><button class="addSet bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">+ Add Set</button><button class="copyLast bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">Copy Last</button><button class="removeExercise text-red-400 hover:text-red-300 px-4 py-2 text-sm ml-auto">Remove</button></div>${exerciseProgressHtml(ex)}<div>${setsHtml}</div>`;
     card.querySelector(".ex-fav-toggle").addEventListener("click", (e) => {
       e.preventDefault();
       toggleFavoriteExercise(ex.exerciseId);
@@ -1545,12 +2224,17 @@ function renderWorkoutBuilder() {
     card.querySelector(".removeExercise").addEventListener("click", () => { workoutState.exercises.splice(exIndex, 1); renderWorkoutBuilder(); scheduleAutosave(); });
     card.querySelectorAll("[data-idx]").forEach(row => {
       const idx = Number(row.dataset.idx);
-      row.querySelector(".w").addEventListener("input", e => { ex.sets[idx].weight = e.target.value; trackTime(); scheduleAutosave(); });
-      row.querySelector(".r").addEventListener("input", e => { ex.sets[idx].reps = e.target.value; trackTime(); scheduleAutosave(); });
+      row.querySelector(".w").addEventListener("input", e => { ex.sets[idx].weight = e.target.value; trackTime(); updateSetComparisonRow(card, ex, idx); scheduleAutosave(); });
+      row.querySelector(".r").addEventListener("input", e => { ex.sets[idx].reps = e.target.value; trackTime(); updateSetComparisonRow(card, ex, idx); scheduleAutosave(); });
       row.querySelector(".p").addEventListener("input", e => { ex.sets[idx].rpe = e.target.value; trackTime(); scheduleAutosave(); });
       row.querySelector(".rem").addEventListener("click", () => { ex.sets.splice(idx, 1); if (!ex.sets.length) ex.sets.push({ weight: "", reps: "", rpe: "" }); trackTime(); renderWorkoutBuilder(); scheduleAutosave(); });
     });
     els.workoutExercises.appendChild(card);
+    card.querySelector(".retry-progress")?.addEventListener("click", () => ensureExerciseProgressLoaded(ex, { force: true }));
+    if (!exerciseProgressLoadsStarted.has(ex)) {
+      exerciseProgressLoadsStarted.add(ex);
+      ensureExerciseProgressLoaded(ex).catch(() => {});
+    }
   });
 }
 
@@ -1576,7 +2260,7 @@ async function updatePRsAfterWorkout(completedExercises) {
         weight: best.weight,
         reps: best.reps,
         unit: els.unitSelect?.value || "lb",
-        date: todayISO(),
+        date: selectedWorkoutDate(),
         timestamp: serverTimestamp(),
       });
     }
@@ -1808,6 +2492,134 @@ function compareWorkoutsByDateDesc(a, b) {
   return (Number(b?.updatedAtMs) || 0) - (Number(a?.updatedAtMs) || 0);
 }
 
+function workoutFullDisplayDate(workout) {
+  const { displayDate, timeString } = workoutDisplayMeta(workout || {});
+  return timeString ? `${displayDate} at ${timeString}` : displayDate;
+}
+
+function createWorkoutListItem(workout, options = {}) {
+  const { compact = false } = options;
+  const { displayDate, timeString } = workoutDisplayMeta(workout);
+  const fullDateStr = workoutFullDisplayDate(workout);
+  const div = document.createElement("div");
+  div.className = compact
+    ? "rounded-xl border border-zinc-800 bg-zinc-950/70 px-3 py-2 transition hover:border-emerald-500/50"
+    : "bg-zinc-800 p-4 rounded-xl flex justify-between items-center border border-zinc-700 cursor-pointer hover:border-emerald-500/50 transition-colors";
+  const exerciseCount = Number(workout.exerciseCount || (workout.exercises || []).length || (workout.exerciseSummaries || []).length || 0);
+  const hasSessionNotes = typeof workout.notes === "string" && workout.notes.trim().length > 0;
+  if (compact) {
+    div.innerHTML = `<div class="flex items-center justify-between gap-3"><div class="min-w-0"><div class="truncate text-sm font-semibold text-zinc-200">${escapeHtml(workout.routineName || "Custom Workout")}</div><div class="text-xs text-zinc-500">${escapeHtml(displayDate)} ${escapeHtml(timeString)}</div></div><div class="shrink-0 text-xs font-bold text-emerald-400">${exerciseCount}</div></div>`;
+  } else {
+    div.innerHTML = `<div><div class="font-medium text-zinc-200">${escapeHtml(displayDate)} <span class="text-zinc-500 text-xs ml-1">${escapeHtml(timeString)}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises${hasSessionNotes ? ` <span class="ml-2 text-amber-400"><i class="fa-regular fa-note-sticky mr-1"></i>Notes</span>` : ""}</div></div><div class="text-right text-emerald-400 font-bold">${escapeHtml(workout.routineName || "Custom Workout")}</div>`;
+  }
+  div.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openWorkoutDetailsFromSummary(workout, fullDateStr);
+  };
+  return div;
+}
+
+let recentWorkoutsRows = [];
+let recentWorkoutsCursor = null;
+let recentWorkoutsHasMore = true;
+let recentWorkoutsLoading = false;
+const RECENT_WORKOUTS_PAGE_SIZE = 20;
+
+function resetRecentWorkoutsState() {
+  recentWorkoutsRows = [];
+  recentWorkoutsCursor = null;
+  recentWorkoutsHasMore = true;
+  recentWorkoutsLoading = false;
+}
+
+function renderRecentWorkoutsSignedOut() {
+  if (els.recentWorkouts) els.recentWorkouts.innerHTML = `<div class="text-zinc-500 rounded-xl border border-dashed border-zinc-800 py-10 px-4 text-center text-sm">Sign in to see workout history.</div>`;
+  if (els.recentWorkoutsPreview) els.recentWorkoutsPreview.innerHTML = `<div class="text-sm text-zinc-500">Sign in to preview workouts.</div>`;
+  els.loadMoreWorkoutsBtn?.classList.add("hidden");
+}
+
+function renderRecentWorkoutsError(message) {
+  if (els.recentWorkouts) els.recentWorkouts.innerHTML = `<div class="text-red-400 rounded-xl border border-red-500/20 bg-red-500/5 py-6 px-4 text-center text-sm">${escapeHtml(message)}</div>`;
+  els.loadMoreWorkoutsBtn?.classList.add("hidden");
+}
+
+function renderRecentWorkoutsPreview(rows) {
+  if (!els.recentWorkoutsPreview) return;
+  const list = (rows || recentWorkoutsRows).slice(0, 3);
+  els.recentWorkoutsPreview.innerHTML = "";
+  if (!currentUser) return renderRecentWorkoutsSignedOut();
+  if (!list.length) {
+    els.recentWorkoutsPreview.innerHTML = `<div class="text-sm text-zinc-500">No saved workouts yet.</div>`;
+    return;
+  }
+  list.forEach((workout) => els.recentWorkoutsPreview.appendChild(createWorkoutListItem(workout, { compact: true })));
+}
+
+function renderRecentWorkoutsPage() {
+  if (!els.recentWorkouts) return;
+  if (!currentUser) return renderRecentWorkoutsSignedOut();
+  els.recentWorkouts.innerHTML = "";
+  if (!recentWorkoutsRows.length) {
+    els.recentWorkouts.innerHTML = `<div class="text-zinc-500 rounded-xl border border-dashed border-zinc-800 py-10 px-4 text-center text-sm">No saved workouts yet.</div>`;
+  } else {
+    recentWorkoutsRows.forEach((workout) => els.recentWorkouts.appendChild(createWorkoutListItem(workout)));
+  }
+  if (els.loadMoreWorkoutsBtn) {
+    els.loadMoreWorkoutsBtn.classList.toggle("hidden", !recentWorkoutsHasMore || recentWorkoutsRows.length === 0);
+    els.loadMoreWorkoutsBtn.disabled = recentWorkoutsLoading;
+    els.loadMoreWorkoutsBtn.innerHTML = recentWorkoutsLoading ? `<i class="fa-solid fa-spinner fa-spin mr-2"></i>Loading...` : "Load more workouts";
+  }
+}
+
+async function refreshRecentWorkoutsPage(options = {}) {
+  if (!currentUser) return;
+  const { reset = false, renderLoading = true } = options;
+  if (recentWorkoutsLoading) return;
+  if (reset) resetRecentWorkoutsState();
+  if (!recentWorkoutsHasMore) {
+    renderRecentWorkoutsPage();
+    return;
+  }
+  recentWorkoutsLoading = true;
+  if (renderLoading && els.recentWorkouts && recentWorkoutsRows.length === 0) {
+    els.recentWorkouts.innerHTML = `<div class="text-zinc-500 rounded-xl border border-zinc-800 py-10 px-4 text-center text-sm"><i class="fa-solid fa-spinner fa-spin mr-2"></i>Loading workouts...</div>`;
+  }
+  renderRecentWorkoutsPage();
+  try {
+    const constraints = [
+      where("status", "==", "final"),
+      orderBy("updatedAtMs", "desc"),
+    ];
+    if (recentWorkoutsCursor) constraints.push(startAfter(recentWorkoutsCursor));
+    constraints.push(limit(RECENT_WORKOUTS_PAGE_SIZE));
+    const snap = await getDocs(query(collection(db, "users", currentUser.uid, "workouts"), ...constraints));
+    const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    recentWorkoutsRows = mergeWorkoutLikeRecords(recentWorkoutsRows, rows)
+      .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0));
+    recentWorkoutsCursor = snap.docs[snap.docs.length - 1] || recentWorkoutsCursor;
+    recentWorkoutsHasMore = snap.docs.length === RECENT_WORKOUTS_PAGE_SIZE;
+    analyticsWindowWorkouts = mergeWorkoutLikeRecords(analyticsWindowWorkouts, rows)
+      .sort(compareWorkoutsByDateDesc);
+    renderRecentWorkoutsPreview();
+  } catch (e) {
+    console.error("Recent workouts query failed", e);
+    renderRecentWorkoutsError("Could not load workouts.");
+  } finally {
+    recentWorkoutsLoading = false;
+    renderRecentWorkoutsPage();
+  }
+}
+
+async function ensureRecentWorkoutsPageLoaded() {
+  if (!currentUser) return renderRecentWorkoutsSignedOut();
+  if (recentWorkoutsRows.length) {
+    renderRecentWorkoutsPage();
+    return;
+  }
+  await refreshRecentWorkoutsPage({ reset: true, renderLoading: true });
+}
+
 function workoutFallsWithinDateWindow(workout, minDateStr) {
   const { dDate } = workoutDisplayMeta(workout || {});
   return typeof dDate === "string" && dDate >= minDateStr;
@@ -1837,7 +2649,7 @@ async function fetchDateWindowRows(baseConstraintsFactory, minDateStr, pageSize 
 }
 
 async function loadAnalytics() {
-  if (!currentUser || !els.analyticsContent || !els.recentWorkouts) return;
+  if (!currentUser || !els.analyticsContent) return;
   try {
     const summariesCol = workoutSummariesCollection();
     const workoutsCol = collection(db, "users", currentUser.uid, "workouts");
@@ -1916,7 +2728,7 @@ async function loadAnalytics() {
       .slice(0, 8);
     if (recentList.length === 0) recentList = [...mergedRecentRows].sort(compareWorkoutsByDateDesc).slice(0, 8);
 
-    els.recentWorkouts.innerHTML = "";
+    renderRecentWorkoutsPreview(recentList);
     const workoutsByDate = {};
 
     analyticsWindowWorkouts.forEach((w) => {
@@ -1925,33 +2737,19 @@ async function loadAnalytics() {
       workoutsByDate[dDate].push(w);
     });
 
-    recentList.slice(0, 5).forEach((w) => {
-      const { displayDate, timeString } = workoutDisplayMeta(w);
-      const fullDateStr = timeString ? `${displayDate} at ${timeString}` : displayDate;
-      const div = document.createElement("div");
-      div.className =
-        "bg-zinc-800 p-4 rounded-xl flex justify-between items-center border border-zinc-700 cursor-pointer hover:border-emerald-500/50 transition-colors";
-      const exerciseCount = Number(w.exerciseCount || (w.exercises || []).length || 0);
-      const hasSessionNotes = typeof w.notes === "string" && w.notes.trim().length > 0;
-      div.innerHTML = `<div><div class="font-medium text-zinc-200">${displayDate} <span class="text-zinc-500 text-xs ml-1">${timeString}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises${hasSessionNotes ? ` <span class="ml-2 text-amber-400"><i class="fa-regular fa-note-sticky mr-1"></i>Notes</span>` : ""}</div></div><div class="text-right text-emerald-400 font-bold">${escapeHtml(w.routineName || "Custom Workout")}</div>`;
-      div.onclick = () => openWorkoutDetailsFromSummary(w, fullDateStr);
-      els.recentWorkouts.appendChild(div);
-    });
-
     // Generate Unified Analytics & Heatmap Layout
     let heatHtml = `<div id="heatmapGrid" class="flex flex-wrap gap-1.5 justify-center mt-5 mb-3">`;
     for (let i = 89; i >= 0; i--) {
         const d = new Date(today); d.setDate(d.getDate() - i); const dateStr = toLocalISODate(d);
         const dayWorkouts = workoutsByDate[dateStr] || [];
         const uniqueFocuses = uniqueHeatFocusesForDay(dayWorkouts);
-        const routineNames = dayWorkouts.map(w => w.routineName || "Custom Workout").join(" + ");
         const vis = heatmapCellVisual(uniqueFocuses, dayWorkouts.length > 0);
         const baseCell = "w-4 h-4 rounded-sm cursor-pointer hover:ring-2 hover:ring-zinc-400 transition-all overflow-hidden shrink-0";
         const tip = dayWorkouts.length
           ? (uniqueFocuses.length ? `${dateStr} — ${uniqueFocuses.join(", ")}` : `${dateStr} — workout (no focus selected)`)
           : dateStr;
         const styleAttr = vis.kind === "split" && vis.style ? ` style="${escapeHtml(vis.style)}"` : "";
-        heatHtml += `<div class="${baseCell} ${vis.className}" data-date="${dateStr}" data-routines="${escapeHtml(routineNames)}" data-focus="${escapeHtml(uniqueFocuses.join(", "))}" title="${escapeHtml(tip)}"${styleAttr}></div>`;
+        heatHtml += `<div class="${baseCell} ${vis.className}" data-date="${dateStr}" data-focus="${escapeHtml(uniqueFocuses.join(", "))}" title="${escapeHtml(tip)}"${styleAttr}></div>`;
     }
     heatHtml += `</div>`;
 
@@ -1981,24 +2779,9 @@ async function loadAnalytics() {
         const cell = e.target.closest("[data-date]");
         if (!cell) return;
         const dateClicked = cell.getAttribute("data-date");
-        const routines = cell.getAttribute("data-routines");
-        const focusList = cell.getAttribute("data-focus");
-        const dObj = new Date(dateClicked + "T12:00:00");
-        const displayDate = dObj.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-
         const displayBox = document.getElementById("newHeatSelectedDateDisplay");
-        displayBox.classList.remove("hidden");
-        if (routines) {
-          const focusHtml = focusList
-            ? `<span class="text-zinc-500 ml-2">(${escapeHtml(focusList)})</span>`
-            : "";
-          displayBox.innerHTML = `<span class="text-zinc-400">${displayDate}:</span> <span class="font-bold text-white ml-2">${escapeHtml(routines)}</span>${focusHtml}`;
-        } else {
-          displayBox.innerHTML = `<span class="text-zinc-400">${displayDate}:</span> <span class="text-zinc-500 ml-2">Rest Day</span>`;
-        }
+        openHeatmapDateDetails(dateClicked, displayBox);
     });
-
-    if (recentList.length === 0) els.recentWorkouts.innerHTML = "<div class='text-zinc-500'>No recent workouts</div>";
   } catch (e) { console.error("Analytics error", e); }
 }
 
@@ -2024,6 +2807,35 @@ async function openWorkoutDetailsFromSummary(summary, displayDate) {
     }
     setStatus("Could not load workout details.", "error");
   }
+}
+
+function workoutsForLocalDate(dateStr) {
+  return mergeWorkoutLikeRecords(analyticsWindowWorkouts, recentWorkoutsRows)
+    .filter((workout) => workoutDisplayMeta(workout).dDate === dateStr)
+    .sort(compareWorkoutsByDateDesc);
+}
+
+function openHeatmapDateDetails(dateStr, displayBox) {
+  if (!dateStr || !displayBox) return;
+  const dObj = new Date(`${dateStr}T12:00:00`);
+  const displayDate = dObj.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  const dayWorkouts = workoutsForLocalDate(dateStr);
+  displayBox.classList.remove("hidden");
+
+  if (dayWorkouts.length === 0) {
+    displayBox.innerHTML = `<span class="text-zinc-400">${escapeHtml(displayDate)}:</span> <span class="text-zinc-500 ml-2">No workouts saved for this date.</span>`;
+    return;
+  }
+
+  if (dayWorkouts.length === 1) {
+    displayBox.innerHTML = `<span class="text-zinc-400">${escapeHtml(displayDate)}:</span> <span class="text-emerald-400 ml-2">Opening workout details...</span>`;
+    openWorkoutDetailsFromSummary(dayWorkouts[0], workoutFullDisplayDate(dayWorkouts[0]));
+    return;
+  }
+
+  displayBox.innerHTML = `<div class="mb-3"><span class="text-zinc-400">${escapeHtml(displayDate)}:</span> <span class="font-bold text-white ml-2">${dayWorkouts.length} workouts</span></div><div class="space-y-2" id="heatmapDayWorkoutList"></div>`;
+  const list = displayBox.querySelector("#heatmapDayWorkoutList");
+  dayWorkouts.forEach((workout) => list.appendChild(createWorkoutListItem(workout, { compact: true })));
 }
 
 function showWorkoutDetailsModal(workout, displayDate) {
@@ -2064,7 +2876,7 @@ function showWorkoutDetailsModal(workout, displayDate) {
                 contentHtml += `<div class="text-sm text-zinc-500">Summary available, but no set-level details were stored.</div>`;
             }
         } else {
-            const validSets = (ex.sets || []).filter(s => s.weight && s.weight.toString().trim() !== "");
+            const validSets = (ex.sets || []).filter(s => (parseInt(String(s.reps ?? ""), 10) || 0) > 0 || String(s.weight ?? "").trim() !== "");
             if(validSets.length === 0) { contentHtml += `<div class="text-sm text-zinc-500">No valid sets recorded.</div>`; } else { validSets.forEach((s, i) => { contentHtml += `<div class="flex gap-4 text-sm bg-zinc-900 p-2 rounded-lg mb-1 border border-zinc-800"><div class="text-zinc-500 w-12">Set ${i+1}</div><div class="font-medium">${s.weight} ${workout.unit || 'lb'}</div><div class="font-medium text-emerald-400">× ${s.reps} reps</div></div>`; }); }
         }
         contentHtml += `</div>`;
@@ -2146,22 +2958,10 @@ let timerSeconds = TIMER_DEFAULT_SECONDS;
 let timerEndAt = null;
 let isTimerRunning = false;
 let timerInterval = null;
-let alarmSound = null;
 let timerAudioContext = null;
+let timerAlarmBuffer = null;
+let timerAlarmBufferPromise = null;
 let timerAudioUnlocked = false;
-
-function ensureAlarmSound() {
-  if (alarmSound) return alarmSound;
-  alarmSound = new Audio("/rest-timer-finished.wav");
-  alarmSound.preload = "auto";
-  alarmSound.playsInline = true;
-  try {
-    alarmSound.load();
-  } catch (_) {
-    // Ignore preload/load errors and fall back later if needed.
-  }
-  return alarmSound;
-}
 
 function ensureTimerAudioContext() {
   if (!TimerAudioContextCtor) return null;
@@ -2175,9 +2975,46 @@ function ensureTimerAudioContext() {
   return timerAudioContext;
 }
 
-async function primeTimerAudio() {
-  const sound = ensureAlarmSound();
+function configureTimerAudioSession() {
+  try {
+    if (navigator.audioSession && navigator.audioSession.type !== "ambient") {
+      navigator.audioSession.type = "ambient";
+    }
+  } catch (_) {
+    // Ignore unsupported or rejected audio session changes.
+  }
+}
+
+async function loadTimerAlarmBuffer() {
+  if (timerAlarmBuffer) return timerAlarmBuffer;
+  if (timerAlarmBufferPromise) return timerAlarmBufferPromise;
   const context = ensureTimerAudioContext();
+  if (!context) return null;
+  timerAlarmBufferPromise = fetch("/rest-timer-finished.wav")
+    .then((response) => {
+      if (!response.ok) throw new Error(`Alarm fetch failed: ${response.status}`);
+      return response.arrayBuffer();
+    })
+    .then((arrayBuffer) => context.decodeAudioData(arrayBuffer.slice(0)))
+    .then((decodedBuffer) => {
+      timerAlarmBuffer = decodedBuffer;
+      return decodedBuffer;
+    })
+    .catch(() => null)
+    .finally(() => {
+      timerAlarmBufferPromise = null;
+    });
+  return timerAlarmBufferPromise;
+}
+
+async function primeTimerAudio() {
+  configureTimerAudioSession();
+  const context = ensureTimerAudioContext();
+  loadTimerAlarmBuffer().catch(() => {});
+  if (!context) {
+    timerAudioUnlocked = false;
+    return false;
+  }
   if (context?.state === "suspended") {
     try {
       await context.resume();
@@ -2185,29 +3022,8 @@ async function primeTimerAudio() {
       // Resume can fail until Safari considers the gesture trusted.
     }
   }
-
-  try {
-    const wasMuted = sound.muted;
-    const priorVolume = sound.volume;
-    sound.muted = true;
-    sound.volume = 0;
-    const playAttempt = sound.play();
-    if (playAttempt?.then) await playAttempt;
-    sound.pause();
-    sound.currentTime = 0;
-    sound.muted = wasMuted;
-    sound.volume = priorVolume;
-    timerAudioUnlocked = true;
-    return true;
-  } catch (_) {
-    sound.pause();
-    sound.currentTime = 0;
-    if (context?.state === "running") {
-      timerAudioUnlocked = true;
-      return true;
-    }
-    return false;
-  }
+  timerAudioUnlocked = context.state === "running";
+  return timerAudioUnlocked;
 }
 
 function playTimerAlarmFallback() {
@@ -2231,20 +3047,41 @@ function playTimerAlarmFallback() {
   return true;
 }
 
+function playTimerAlarmBuffer(buffer) {
+  const context = ensureTimerAudioContext();
+  if (!context || context.state !== "running" || !buffer) return false;
+  const source = context.createBufferSource();
+  const gain = context.createGain();
+  source.buffer = buffer;
+  gain.gain.value = 1;
+  source.connect(gain);
+  gain.connect(context.destination);
+  source.start();
+  return true;
+}
+
 function playTimerAlarm() {
-  try {
-    const sound = ensureAlarmSound();
-    sound.currentTime = 0;
-    const playAttempt = sound.play();
-    if (playAttempt?.catch) {
-      playAttempt.catch(() => {
+  configureTimerAudioSession();
+  const context = ensureTimerAudioContext();
+  if (context?.state === "running") {
+    if (timerAlarmBuffer && playTimerAlarmBuffer(timerAlarmBuffer)) return;
+    loadTimerAlarmBuffer()
+      .then((buffer) => {
+        if (playTimerAlarmBuffer(buffer)) return;
+        if (!playTimerAlarmFallback()) {
+          timerAudioUnlocked = false;
+        }
+      })
+      .catch(() => {
         if (!playTimerAlarmFallback()) {
           timerAudioUnlocked = false;
         }
       });
-    }
-  } catch (_) {
-    playTimerAlarmFallback();
+    return;
+  }
+
+  if (!playTimerAlarmFallback()) {
+    timerAudioUnlocked = false;
   }
 }
 
@@ -2423,6 +3260,7 @@ window.addEventListener("pageshow", () => {
     timerAudioContext.resume().catch(() => {});
   }
   recalcAfterForeground();
+  recheckWorkoutDateAfterReturn().catch((error) => console.warn("Workout date recheck failed", error));
 });
 window.addEventListener("pagehide", () => {
     syncSecondsFromEndTime();
@@ -2433,6 +3271,7 @@ window.addEventListener("focus", () => {
       timerAudioContext.resume().catch(() => {});
     }
     recalcAfterForeground();
+    recheckWorkoutDateAfterReturn().catch((error) => console.warn("Workout date recheck failed", error));
 });
 window.addEventListener("blur", () => {
     syncSecondsFromEndTime();
