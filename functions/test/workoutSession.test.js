@@ -133,7 +133,7 @@ test("a finished workout cannot be reverted to a draft by a late autosave", () =
   const rules = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf8");
 
   const saveDraft = appSource.match(/async function saveWorkoutDraft\(\) \{[\s\S]*?\n\}/)[0];
-  assert.match(saveDraft, /isFinishingWorkout\) return/, "autosave must be skipped while finishing");
+  assert.match(saveDraft, /isFinishingWorkout \|\| isDiscardingWorkout\) return/, "autosave must be skipped while finishing or discarding");
   assert.match(saveDraft, /setDoc\(draftRef,/, "autosave must write to the ref captured at call time");
   assert.match(appSource, /waitForPendingWrites\(db\)/, "in-flight draft writes must settle before finalize");
   assert.match(appSource, /already finalized/i, "an already-finalized error must clear stale draft state");
@@ -145,4 +145,50 @@ test("a finished workout cannot be reverted to a draft by a late autosave", () =
 test("workout details show bodyweight sets that have reps but no weight", () => {
   const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
   assert.doesNotMatch(appSource, /filter\(s => s\.weight && s\.weight\.toString\(\)\.trim\(\) !== ""\)/);
+});
+
+test("only empty, stale, non-active drafts are selected for automatic cleanup", async () => {
+  const { selectEmptyStaleDraftIds, draftHasMeaningfulProgress, countLoggedSets } = await loadClientModule("../../public/js/workoutSession.js");
+  const nowMs = 10 * 60 * 60 * 1000;
+  const old = nowMs - 2 * 60 * 60 * 1000;
+  const blank = { status: "draft", exercises: [], focus: [], notes: "", templateId: null, routineName: "Custom Workout" };
+  const drafts = [
+    { id: "blank-old", updatedAtMs: old, ...blank },
+    { id: "blank-recent", updatedAtMs: nowMs - 60 * 1000, ...blank },
+    { id: "blank-active", updatedAtMs: old, ...blank },
+    { id: "has-exercise", updatedAtMs: old, ...blank, exercises: [{ exerciseId: "squat", sets: [] }] },
+    { id: "has-notes", updatedAtMs: old, ...blank, notes: "felt strong" },
+    { id: "has-routine", updatedAtMs: old, ...blank, routineName: "Leg Day" },
+    { id: "has-template", updatedAtMs: old, ...blank, templateId: "t1" },
+    { id: "has-focus", updatedAtMs: old, ...blank, focus: ["Legs"] },
+    { id: "final-one", updatedAtMs: old, ...blank, status: "final" },
+    { updatedAtMs: old, ...blank },
+  ];
+  assert.deepEqual(selectEmptyStaleDraftIds(drafts, { activeId: "blank-active", nowMs }), ["blank-old"]);
+  assert.equal(draftHasMeaningfulProgress(blank), false);
+  assert.equal(draftHasMeaningfulProgress({ ...blank, exercises: [{}] }), true);
+  assert.equal(countLoggedSets([
+    { sets: [{ weight: "135", reps: "5" }, { weight: "", reps: "" }, { weight: "", reps: "12" }, { weight: "20", reps: "" }] },
+    { sets: [{ weight: "", reps: "" }] },
+    null,
+  ]), 3);
+});
+
+test("draft cleanup is wired: one draft at a time, in-app discard, safe discard of the active workout", () => {
+  const appSource = fs.readFileSync(path.resolve(__dirname, "../../public/app.js"), "utf8");
+  const html = fs.readFileSync(path.resolve(__dirname, "../../public/index.html"), "utf8");
+
+  assert.match(html, /id="discardWorkoutBtn"/);
+  assert.match(appSource, /runBootstrapStep\("draft cleanup", \(\) => purgeEmptyStaleDrafts\(\)\)/);
+  // every way of starting a workout must stop when an unfinished draft already exists
+  const guardCalls = appSource.match(/if \(await blockStartIfUnfinishedDraft\(\)\) return;/g) || [];
+  assert.equal(guardCalls.length, 3, "blank start, routine start and AI routine start must all be guarded");
+  // deleting the active workout must not be undone by a late autosave
+  const discard = appSource.match(/async function discardWorkoutDraft\([\s\S]*?\n\}/)[0];
+  assert.match(discard, /isDiscardingWorkout = true/);
+  assert.match(discard, /finally \{\s*isDiscardingWorkout = false;/);
+  assert.match(appSource, /isFinishingWorkout \|\| isDiscardingWorkout\) return;/);
+  // discarding a draft with logged sets asks first, and the prompt moves on to the next draft
+  assert.match(appSource, /Permanently delete the unfinished workout/);
+  assert.match(appSource, /if \(next\.best\) showDraftRecoveryDialog\(next\.best, next\.count\)/);
 });

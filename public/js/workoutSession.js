@@ -193,3 +193,41 @@ export function progressStateMessage(status, sessionCount = 0) {
   if (status === "ready" && sessionCount === 0) return "No previous workout recorded for this exercise";
   return "";
 }
+
+/** A draft is worth keeping/offering when the user authored anything: exercises, focus, notes, a routine or a name. */
+export function draftHasMeaningfulProgress(draft) {
+  if (!draft || typeof draft !== "object") return false;
+  const exercises = Array.isArray(draft.exercises) ? draft.exercises : [];
+  if (exercises.length > 0) return true;
+  if (Array.isArray(draft.focus) && draft.focus.length > 0) return true;
+  if (typeof draft.notes === "string" && draft.notes.trim()) return true;
+  if (typeof draft.templateId === "string" && draft.templateId.trim()) return true;
+  const routineName = String(draft.routineName || "").trim();
+  if (routineName && routineName !== "Custom Workout") return true;
+  return false;
+}
+
+/** Number of sets with a rep count or a weight entered, across all exercises. */
+export function countLoggedSets(exercises) {
+  return (Array.isArray(exercises) ? exercises : []).reduce((total, exercise) => (
+    total + (Array.isArray(exercise?.sets) ? exercise.sets : []).filter((set) => (
+      (parseInt(String(set?.reps ?? ""), 10) || 0) > 0 || String(set?.weight ?? "").trim() !== ""
+    )).length
+  ), 0);
+}
+
+/**
+ * Ids of drafts that hold nothing the user authored (see draftHasMeaningfulProgress) and have sat untouched
+ * long enough that they cannot be a workout just started on another device. Safe to delete without asking.
+ */
+export function selectEmptyStaleDraftIds(drafts, { activeId = null, nowMs = Date.now(), minAgeMs = 60 * 60 * 1000 } = {}) {
+  return (Array.isArray(drafts) ? drafts : [])
+    .filter((draft) => (
+      draft?.id &&
+      draft.status === "draft" &&
+      draft.id !== activeId &&
+      !draftHasMeaningfulProgress(draft) &&
+      nowMs - (Number(draft.updatedAtMs) || 0) >= minAgeMs
+    ))
+    .map((draft) => draft.id);
+}

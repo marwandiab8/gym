@@ -15,6 +15,8 @@ import {
 import {
   applyDraftDateChoice,
   compareSetPerformance,
+  countLoggedSets,
+  draftHasMeaningfulProgress,
   formatCalendarDate,
   localCalendarDateKey,
   needsWorkoutDateConfirmation,
@@ -22,6 +24,7 @@ import {
   previousSetPlaceholder,
   progressStateMessage,
   resolveNewWorkoutDate,
+  selectEmptyStaleDraftIds,
   selectPreviousExerciseSessions,
 } from "./js/workoutSession.js";
 
@@ -48,7 +51,7 @@ const els = {
   homeView: document.getElementById("homeView"),
   recentView: document.getElementById("recentView"),
   routinesView: document.getElementById("routinesView"),
-  userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), createCustomExerciseBtn: document.getElementById("createCustomExerciseBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"), recentWorkoutsPreview: document.getElementById("recentWorkoutsPreview"), loadMoreWorkoutsBtn: document.getElementById("loadMoreWorkoutsBtn"),
+  userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), createCustomExerciseBtn: document.getElementById("createCustomExerciseBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), discardWorkoutBtn: document.getElementById("discardWorkoutBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"), recentWorkoutsPreview: document.getElementById("recentWorkoutsPreview"), loadMoreWorkoutsBtn: document.getElementById("loadMoreWorkoutsBtn"),
   workoutModal: document.getElementById("workoutModal"), modalTitle: document.getElementById("modalTitle"), modalContent: document.getElementById("modalContent"), closeModalBtn: document.getElementById("closeModalBtn"),
   toggleTimerBtn: document.getElementById("toggleTimerBtn"), restTimerWidget: document.getElementById("restTimerWidget"), timerDisplay: document.getElementById("timerDisplay"), timerAddBtn: document.getElementById("timerAddBtn"), timerPlayPauseBtn: document.getElementById("timerPlayPauseBtn"), timerStopBtn: document.getElementById("timerStopBtn"), timerCloseBtn: document.getElementById("timerCloseBtn"),
   chartExerciseSelect: document.getElementById("chartExerciseSelect"),
@@ -83,6 +86,7 @@ const DEFAULT_APP_THEME_COLOR = "#34d399";
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
 let currentRoute = "home";
 let isFinishingWorkout = false;
+let isDiscardingWorkout = false;
 const exerciseProgressCache = new Map();
 const exerciseProgressLoadsStarted = new WeakSet();
 
@@ -372,6 +376,7 @@ function setSaveIndicator(msg, kind = "saved", clearAfterMs = 2200) {
 function setActiveBadge() {
   if (els.activeWorkoutBadge) { els.activeWorkoutBadge.classList.toggle("hidden", !activeWorkoutRef); els.activeWorkoutBadge.textContent = activeWorkoutRef ? "IN PROGRESS" : ""; }
   if (els.saveTemplateBtn) els.saveTemplateBtn.classList.toggle("hidden", !activeWorkoutRef);
+  if (els.discardWorkoutBtn) els.discardWorkoutBtn.classList.toggle("hidden", !activeWorkoutRef);
   if (els.updateTemplateBtn) els.updateTemplateBtn.classList.toggle("hidden", !(activeWorkoutRef && workoutState.templateId));
   els.workoutNotesWrap?.classList.toggle("hidden", !activeWorkoutRef);
 }
@@ -476,18 +481,6 @@ function buildLocalDraftSnapshot() {
   };
 }
 
-function draftHasMeaningfulProgress(draft) {
-  if (!draft || typeof draft !== "object") return false;
-  const exercises = Array.isArray(draft.exercises) ? draft.exercises : [];
-  if (exercises.length > 0) return true;
-  if (Array.isArray(draft.focus) && draft.focus.length > 0) return true;
-  if (typeof draft.notes === "string" && draft.notes.trim()) return true;
-  if (typeof draft.templateId === "string" && draft.templateId.trim()) return true;
-  const routineName = String(draft.routineName || "").trim();
-  if (routineName && routineName !== "Custom Workout") return true;
-  return false;
-}
-
 function writeLocalDraftSnapshot() {
   const k = localDraftStorageKey(currentUser?.uid);
   if (!k || !activeWorkoutRef) return;
@@ -581,7 +574,7 @@ function sanitizeDraftExercisesForStorage(exercises) {
 async function saveWorkoutDraft() {
   // Never write status:"draft" while finishing: a late draft write landing after finalizeWorkout
   // would turn the saved workout back into a draft (and re-trigger the resume prompt).
-  if (!activeWorkoutRef || !currentUser || isFinishingWorkout) return;
+  if (!activeWorkoutRef || !currentUser || isFinishingWorkout || isDiscardingWorkout) return;
   const draftRef = activeWorkoutRef;
   writeLocalDraftSnapshot();
   setSaveIndicator("Saving…", "saving", 0);
@@ -673,24 +666,43 @@ function mergeLocalDraftIfNewer(cloudDraft, localSnap) {
   };
 }
 
-async function resolveDraftRowForResume() {
+/** The newest unfinished draft (merged with a newer local backup) and how many unfinished drafts exist. */
+async function resolveUnfinishedDrafts() {
   const cloudList = await fetchSortedDraftWorkouts();
   const localSnap = readLocalDraftSnapshot();
   const meaningfulCloudList = cloudList.filter(draftHasMeaningfulProgress);
   const meaningfulLocalSnap = draftHasMeaningfulProgress(localSnap) ? localSnap : null;
   if (meaningfulCloudList.length === 0) {
-    if (!meaningfulLocalSnap?.workoutId) return null;
+    if (!meaningfulLocalSnap?.workoutId) return { best: null, count: 0 };
     const s = await getDoc(doc(db, "users", currentUser.uid, "workouts", localSnap.workoutId));
     if (!s.exists() || s.data().status !== "draft") {
       clearLocalDraft();
-      return null;
+      return { best: null, count: 0 };
     }
-    return mergeLocalDraftIfNewer({ id: s.id, ...s.data() }, meaningfulLocalSnap);
+    return { best: mergeLocalDraftIfNewer({ id: s.id, ...s.data() }, meaningfulLocalSnap), count: 1 };
   }
   let best = meaningfulCloudList[0];
   best = mergeLocalDraftIfNewer(best, meaningfulLocalSnap);
-  if (!draftHasMeaningfulProgress(best)) return null;
-  return best;
+  if (!draftHasMeaningfulProgress(best)) return { best: null, count: 0 };
+  return { best, count: meaningfulCloudList.length };
+}
+
+async function resolveDraftRowForResume() {
+  return (await resolveUnfinishedDrafts()).best;
+}
+
+/**
+ * Deletes drafts that hold nothing the user authored (started, then abandoned) so they stop piling up.
+ * Never touches a draft with exercises, notes, focus or a routine, and skips recent ones and the active workout.
+ */
+async function purgeEmptyStaleDrafts() {
+  if (!currentUser) return 0;
+  const uid = currentUser.uid;
+  const ids = selectEmptyStaleDraftIds(await fetchSortedDraftWorkouts(), { activeId: activeWorkoutRef?.id || null });
+  await Promise.all(ids.map((id) =>
+    deleteDoc(doc(db, "users", uid, "workouts", id)).catch((e) => console.warn("Could not remove empty draft", id, e))
+  ));
+  return ids.length;
 }
 
 async function updateResumeDraftButtonState() {
@@ -714,20 +726,29 @@ async function updateResumeDraftButtonState() {
 /** Delete only the targeted draft workout doc and clear the matching local backup. */
 async function discardWorkoutDraft(workoutId = activeWorkoutRef?.id || null) {
   if (!currentUser || !workoutId) return;
-  await deleteDoc(doc(db, "users", currentUser.uid, "workouts", workoutId));
-  const localSnap = readLocalDraftSnapshot();
-  if (localSnap?.workoutId === workoutId) clearLocalDraft();
   if (activeWorkoutRef?.id === workoutId) {
-    resetWorkoutState({ clearLocal: false });
-    setAuthUI();
-    setSaveIndicator("", "saved", 1);
+    // Stop pending or late autosaves from re-creating the document while it is being deleted.
+    isDiscardingWorkout = true;
+    if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+  }
+  try {
+    await deleteDoc(doc(db, "users", currentUser.uid, "workouts", workoutId));
+    const localSnap = readLocalDraftSnapshot();
+    if (localSnap?.workoutId === workoutId) clearLocalDraft();
+    if (activeWorkoutRef?.id === workoutId) {
+      resetWorkoutState({ clearLocal: false });
+      setAuthUI();
+      setSaveIndicator("", "saved", 1);
+    }
+  } finally {
+    isDiscardingWorkout = false;
   }
   setStatus("Draft discarded", "info");
 }
 
 /** Finish: same document becomes `final` — no duplicate completed rows. */
 async function completeWorkoutFromDraft() {
-  if (isFinishingWorkout) return;
+  if (isFinishingWorkout || isDiscardingWorkout) return;
   if (!currentUser) {
     setStatus("Sign in before saving a workout.", "error");
     return;
@@ -852,25 +873,41 @@ async function resumeLatestDraft() {
   }
 }
 
+function showDraftRecoveryDialog(row, count = 1, intro = "") {
+  draftRecoveryShownThisSession = true;
+  const localSnap = readLocalDraftSnapshot();
+  const parts = [];
+  if (intro) parts.push(intro);
+  if (count > 1) parts.push(`You have ${count} unfinished workouts. This is the most recent.`);
+  parts.push(`Last saved: ${new Date(row.updatedAtMs || Date.now()).toLocaleString()}`);
+  parts.push(`Workout date: ${formatCalendarDate(row.dateKey || row.date)}.`);
+  parts.push(`${(row.exercises || []).length} exercise(s), ${countLoggedSets(row.exercises)} logged set(s).`);
+  if (draftHasMeaningfulProgress(localSnap) && localSnap?.workoutId === row.id) parts.push("A backup exists on this device (used if it is newer).");
+  if (els.draftRecoveryText) els.draftRecoveryText.textContent = parts.join(" ");
+  if (els.draftRecoveryDialog && !els.draftRecoveryDialog.open) els.draftRecoveryDialog.showModal();
+}
+
 async function offerDraftRecoveryIfNeeded() {
   if (!currentUser || activeWorkoutRef || draftRecoveryShownThisSession) return;
   const uidAtStart = currentUser.uid;
   await updateResumeDraftButtonState();
-  const row = await resolveDraftRowForResume();
+  const { best: row, count } = await resolveUnfinishedDrafts();
   if (!currentUser || currentUser.uid !== uidAtStart || activeWorkoutRef || draftRecoveryShownThisSession) return;
   if (!row) return;
-  draftRecoveryShownThisSession = true;
-  const localSnap = readLocalDraftSnapshot();
-  const preview = row;
-  const parts = [];
-  if (preview) {
-    parts.push(`Last saved: ${new Date(preview.updatedAtMs || Date.now()).toLocaleString()}`);
-    parts.push(`Workout date: ${formatCalendarDate(preview.dateKey || preview.date)}.`);
-    parts.push(`${(preview.exercises || []).length} exercise(s) in cloud draft.`);
-  }
-  if (draftHasMeaningfulProgress(localSnap) && localSnap?.workoutId) parts.push("A backup exists on this device (used if it is newer).");
-  if (els.draftRecoveryText) els.draftRecoveryText.textContent = parts.join(" ");
-  els.draftRecoveryDialog?.showModal();
+  showDraftRecoveryDialog(row, count);
+}
+
+/**
+ * One unfinished workout at a time: silently starting another would orphan the old draft and bring the
+ * resume prompt back forever. Returns true (after showing the prompt) when the caller must not start a new one.
+ */
+async function blockStartIfUnfinishedDraft() {
+  if (!currentUser || activeWorkoutRef) return false;
+  let found;
+  try { found = await resolveUnfinishedDrafts(); } catch (_) { return false; }
+  if (!found.best) return false;
+  showDraftRecoveryDialog(found.best, found.count, "Finish or discard this workout before starting a new one.");
+  return true;
 }
 
 function suppressDraftRecoveryForNewStart() {
@@ -900,19 +937,37 @@ els.workoutNotesInput?.addEventListener("input", () => {
 });
 
 els.resumeDraftBtn?.addEventListener("click", () => resumeLatestDraft());
+els.discardWorkoutBtn?.addEventListener("click", async () => {
+  if (!currentUser || !activeWorkoutRef || isFinishingWorkout || isDiscardingWorkout) return;
+  const logged = countLoggedSets(workoutState.exercises);
+  const detail = logged > 0 ? `${logged} logged set(s) will be permanently deleted.` : "Nothing has been logged yet.";
+  if (!confirm(`Discard this workout? ${detail} This cannot be undone.`)) return;
+  try {
+    await discardWorkoutDraft(activeWorkoutRef.id);
+    await updateResumeDraftButtonState();
+  } catch (e) {
+    console.error("Discard workout failed", e);
+    setStatus("Could not discard workout", "error");
+  }
+});
 els.draftRecoveryResume?.addEventListener("click", () => resumeLatestDraft());
 els.draftRecoveryDiscard?.addEventListener("click", async () => {
   try {
     els.draftRecoveryDiscard.disabled = true;
-    const row = await resolveDraftRowForResume();
+    const { best: row } = await resolveUnfinishedDrafts();
     if (!row?.id) {
       clearLocalDraft();
       els.draftRecoveryDialog?.close();
       await updateResumeDraftButtonState();
       return;
     }
+    const logged = countLoggedSets(row.exercises);
+    if (logged > 0 && !confirm(`Permanently delete the unfinished workout from ${formatCalendarDate(row.dateKey || row.date)} (${logged} logged set(s))? This cannot be undone.`)) return;
     await discardWorkoutDraft(row.id);
-    els.draftRecoveryDialog?.close();
+    // Several drafts can exist: keep the prompt open for the next one so they can be cleared one by one.
+    const next = await resolveUnfinishedDrafts();
+    if (next.best) showDraftRecoveryDialog(next.best, next.count);
+    else els.draftRecoveryDialog?.close();
     await updateResumeDraftButtonState();
   } catch (e) {
     console.error(e);
@@ -1115,6 +1170,7 @@ onAuthStateChanged(auth, async (user) => {
   setActiveBadge();
   renderWorkoutBuilder();
   await runBootstrapStep("dropdowns", () => populateDropdowns());
+  await runBootstrapStep("draft cleanup", () => purgeEmptyStaleDrafts());
   await runBootstrapStep("resume button", () => updateResumeDraftButtonState());
   await runBootstrapStep("draft recovery", () => offerDraftRecoveryIfNeeded());
   handleRouteChange();
@@ -1922,6 +1978,7 @@ function renderAiPreview(aiExercises) {
 async function applyPendingAiRoutine() {
   if (!currentUser || !pendingAiRoutine?.exercises?.length) return;
   if (activeWorkoutRef && !confirm("You have an active workout in progress. Replace it with this AI routine?")) return;
+  if (await blockStartIfUnfinishedDraft()) return;
   suppressDraftRecoveryForNewStart();
   clearAiError();
   try {
@@ -2100,6 +2157,7 @@ els.updateTemplateBtn?.addEventListener("click", async () => {
 async function startWorkoutFromTemplate(templateId, template) {
     if (!currentUser) return;
     if (activeWorkoutRef && !confirm("You have an active workout. Discard it and start this routine?")) return;
+    if (await blockStartIfUnfinishedDraft()) return;
     try {
         suppressDraftRecoveryForNewStart();
         setStatus("Starting Routine...");
@@ -2140,6 +2198,7 @@ async function startWorkoutFromTemplate(templateId, template) {
 els.startWorkoutBtn?.addEventListener("click", async () => {
   if (!currentUser || activeWorkoutRef) return;
   try {
+    if (await blockStartIfUnfinishedDraft()) return;
     suppressDraftRecoveryForNewStart();
     setStatus("Starting...");
     els.startWorkoutBtn.disabled = true;
