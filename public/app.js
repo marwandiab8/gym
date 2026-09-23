@@ -88,8 +88,9 @@ const INTEGRITY_CHECK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const INTEGRITY_CHECK_KEY_PREFIX = "k2_integrity_check_v1:";
 const APP_THEME_STORAGE_KEY = "k2_app_theme_v1";
 const DEFAULT_APP_THEME_COLOR = "#34d399";
-// Small chevron buttons used to reorder routines and exercises.
-const MOVE_BTN_CLASS = "w-8 h-7 rounded-md border border-zinc-600 text-zinc-300 hover:bg-zinc-700 flex items-center justify-center text-xs transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent";
+// Small chevron buttons used to reorder routines and exercises. Sized to match the 40px
+// favorite-star button they usually sit next to - there was room to spare at the old 32x28.
+const MOVE_BTN_CLASS = "w-10 h-9 rounded-md border border-zinc-600 text-zinc-300 hover:bg-zinc-700 flex items-center justify-center text-sm transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent";
 // routineName, focus, notes — all persisted on the draft document + mirrored in localStorage
 const workoutState = { exercises: [], templateId: null, routineName: "Custom Workout", focus: [], notes: "" };
 let currentRoute = "home";
