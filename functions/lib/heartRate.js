@@ -117,6 +117,51 @@ function daysBetween(startMs, endMs) {
   return days;
 }
 
+/** The minute readings ({ ms, min, avg, max }) that fall in a time window, oldest first. */
+function minuteRows(dayMinutes, startMs, endMs) {
+  const rows = [];
+  for (const day of daysBetween(startMs, endMs)) {
+    const m = dayMinutes[day] || {};
+    for (const [hm, v] of Object.entries(m)) {
+      const ms = msOfMinute(day, hm);
+      // A minute counts when it overlaps the window: it starts after (start - 1 min) and before the end.
+      if (ms > startMs - 60000 && ms < endMs) rows.push({ ms, min: v[0], avg: v[1], max: v[2] });
+    }
+  }
+  return rows.sort((a, b) => a.ms - b.ms);
+}
+
+// An exercise's stretch of the workout: from 2 minutes before its first set was logged (the set is done, then
+// logged) to the minute its last set was logged.
+const EXERCISE_LEAD_MS = 2 * 60000;
+
+/**
+ * Heart rate for each exercise, from its own first and last logged set (firstEditTime / lastEditTime, ms):
+ * [{ i: index in workout.exercises, avg, max, min, minutes, series: [{ m, b }] }] for the exercises with at
+ * least one reading in their stretch.
+ */
+function exerciseHeartRates(dayMinutes, exercises) {
+  const out = [];
+  (Array.isArray(exercises) ? exercises : []).forEach((ex, i) => {
+    const first = Number(ex && (ex.firstEditTime || ex.addedAt));
+    const last = Number(ex && (ex.lastEditTime || ex.firstEditTime || ex.addedAt));
+    if (!Number.isFinite(first) || first <= 0) return;
+    const start = first - EXERCISE_LEAD_MS;
+    const end = Math.max(first, Number.isFinite(last) ? last : first) + 60000;
+    const rows = minuteRows(dayMinutes, start, end);
+    if (!rows.length) return;
+    out.push({
+      i,
+      avg: Math.round(rows.reduce((s, r) => s + r.avg, 0) / rows.length),
+      max: Math.max(...rows.map((r) => r.max)),
+      min: Math.min(...rows.map((r) => r.min)),
+      minutes: rows.length,
+      series: rows.slice(0, 60).map((r) => ({ m: Math.max(0, Math.round((r.ms - start) / 60000)), b: r.avg })),
+    });
+  });
+  return out;
+}
+
 /**
  * A workout's heart-rate summary from the minute readings of its days ({ day: { hm: [min,avg,max] } }):
  * { avg, max, min, minutes, series: [{ m: minutesFromStart, b: bpm }, ...] (at most 90 points - a list of
@@ -125,17 +170,8 @@ function daysBetween(startMs, endMs) {
  */
 function summarizeWorkout(dayMinutes, startMs, endMs) {
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return null;
-  const rows = [];
-  for (const day of daysBetween(startMs, endMs)) {
-    const m = dayMinutes[day] || {};
-    for (const [hm, v] of Object.entries(m)) {
-      const ms = msOfMinute(day, hm);
-      // A minute counts when it overlaps the workout: it starts after (start - 1 min) and before the finish.
-      if (ms > startMs - 60000 && ms < endMs) rows.push({ ms, min: v[0], avg: v[1], max: v[2] });
-    }
-  }
+  const rows = minuteRows(dayMinutes, startMs, endMs);
   if (rows.length < MIN_MINUTES) return null;
-  rows.sort((a, b) => a.ms - b.ms);
   const avg = Math.round(rows.reduce((s, r) => s + r.avg, 0) / rows.length);
   // The graph: one point per minute, or the mean of each run of minutes when the workout is long.
   const step = Math.ceil(rows.length / MAX_SERIES_POINTS);
@@ -153,4 +189,4 @@ function summarizeWorkout(dayMinutes, startMs, endMs) {
   };
 }
 
-module.exports = { MIN_MINUTES, bucketByMinute, daysBetween, heartRateSamples, minuteOf, msOfMinute, parseHaeDate, summarizeWorkout };
+module.exports = { MIN_MINUTES, bucketByMinute, daysBetween, exerciseHeartRates, heartRateSamples, minuteOf, msOfMinute, parseHaeDate, summarizeWorkout };

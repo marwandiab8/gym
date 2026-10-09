@@ -2718,6 +2718,15 @@ async function fillModalHeartRate(workout) {
   if (!hr || currentModalWorkoutId !== workout.id) return;
   const width = Math.max(240, Math.min(560, box.clientWidth || 320));
   box.innerHTML = `<div class="mb-6 rounded-2xl border border-rose-500/20 bg-rose-500/5 px-4 py-3"><div class="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1"><span class="text-xs font-bold uppercase tracking-wide text-rose-300"><i class="fa-solid fa-heart-pulse mr-2"></i>Heart rate</span><span class="text-sm text-zinc-200"><b class="text-white">${hr.avg}</b> avg · <b class="text-white">${hr.max}</b> max · ${hr.min} min <span class="text-zinc-500">bpm</span></span></div>${heartRateSvg(hr, { width, height: 120, axes: true })}<div class="mt-1 text-xs text-zinc-500">From Apple Health · ${hr.minutes} minutes recorded</div></div>`;
+  // Each exercise's own heart rate, beside its time (i = its place in workout.exercises).
+  for (const ex of Array.isArray(hr.exercises) ? hr.exercises : []) {
+    const chip = els.modalContent.querySelector(`[data-hr-ex="${Number(ex.i)}"]`);
+    if (!chip) continue;
+    chip.title = `Heart rate during this exercise: ${ex.avg} avg, ${ex.max} max, ${ex.min} min bpm (${ex.minutes} minutes recorded)`;
+    chip.innerHTML = `<i class="fa-solid fa-heart-pulse"></i><span>${ex.avg} avg · ${ex.max} max</span>${heartRateSvg(ex, { width: 40, height: 14 })}`;
+    chip.classList.remove("hidden");
+    chip.classList.add("flex");
+  }
 }
 
 function heartRateBadge(hr, compact = false) {
@@ -3098,11 +3107,13 @@ function showWorkoutDetailsModal(workout, displayDate) {
     if (!displayExercises.length) {
         contentHtml += `<div class="text-sm text-zinc-500">No exercise details recorded.</div>`;
     }
-    displayExercises.forEach(ex => {
+    const exercisesHaveTimes = displayExercises === workout.exercises;
+    displayExercises.forEach((ex, exIndex) => {
         let timeHtml = ""; let tStart = ex.firstEditTime || ex.addedAt; let tEnd = ex.lastEditTime || ex.firstEditTime || ex.addedAt;
         if (tStart && tEnd && Math.abs(tEnd - tStart) > 60000) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)} - ${formatTimeDisplay(tEnd)}</span>`; } else if (tStart) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)}</span>`; }
         const exNote = (ex.exerciseNote && String(ex.exerciseNote).trim()) ? `<div class="text-sm text-zinc-400 mb-3 pl-1 border-l-2 border-emerald-500/50 py-1"><span class="text-zinc-500 text-xs uppercase tracking-wide mr-2">Notes</span>${escapeHtml(ex.exerciseNote)}</div>` : "";
-        contentHtml += `<div class="mb-6"><div class="font-bold text-lg text-zinc-100 mb-3 flex items-center gap-2">${escapeHtml(ex.name)} ${timeHtml}</div>${exNote}`;
+        const hrChip = exercisesHaveTimes ? `<span data-hr-ex="${exIndex}" class="hidden items-center gap-1.5 text-xs text-rose-300 font-normal bg-rose-500/10 px-2 py-1 rounded"></span>` : "";
+        contentHtml += `<div class="mb-6"><div class="font-bold text-lg text-zinc-100 mb-3 flex flex-wrap items-center gap-2">${escapeHtml(ex.name)} <span class="ml-auto flex flex-wrap items-center justify-end gap-2">${timeHtml}${hrChip}</span></div>${exNote}`;
         if (ex.summaryOnly) {
             const bestWeight = Number(ex.bestWeight) || 0;
             const bestReps = Number(ex.bestReps) || 0;

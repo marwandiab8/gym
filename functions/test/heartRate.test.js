@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { bucketByMinute, daysBetween, heartRateSamples, minuteOf, msOfMinute, parseHaeDate, summarizeWorkout } = require("../lib/heartRate");
+const { bucketByMinute, daysBetween, exerciseHeartRates, heartRateSamples, minuteOf, msOfMinute, parseHaeDate, summarizeWorkout } = require("../lib/heartRate");
 
 test("Health Auto Export dates, with and without a zone", () => {
   assert.equal(new Date(parseHaeDate("2026-10-09 05:12:00 -0400")).toISOString(), "2026-10-09T09:12:00.000Z");
@@ -61,4 +61,21 @@ test("a long workout's graph is thinned to at most 90 points", () => {
   assert.equal(s.series.length, 90);
   assert.equal(s.series[1].m, 2, "two minutes per point");
   assert.ok(s.series.every((p) => !Array.isArray(p)), "no lists inside lists (Firestore refuses them)");
+});
+
+test("each exercise gets the heart rate of its own stretch: 2 minutes before its first set to its last", () => {
+  const day = {};
+  // 05:10-05:40 Toronto: 100 bpm until 05:20, then 140.
+  for (let i = 10; i <= 40; i += 1) day[`05:${String(i).padStart(2, "0")}`] = i < 20 ? [95, 100, 105] : [130, 140, 150];
+  const at = (hm) => msOfMinute("2026-10-09", hm) + 20000;
+  const exercises = [
+    { name: "Chest Press", firstEditTime: at("05:13"), lastEditTime: at("05:18") }, // 05:11..05:19
+    { name: "Incline Press", firstEditTime: at("05:24"), lastEditTime: at("05:33") }, // 05:22..05:34
+    { name: "Not started", firstEditTime: null, addedAt: 0 },
+    { name: "Before the readings", firstEditTime: msOfMinute("2026-10-09", "04:00") },
+  ];
+  const out = exerciseHeartRates({ "2026-10-09": day }, exercises);
+  assert.deepEqual(out.map((x) => [x.i, x.avg, x.max, x.min, x.minutes]), [[0, 100, 105, 95, 9], [1, 140, 150, 130, 13]]);
+  assert.deepEqual(out[0].series[0], { m: 0, b: 100 });
+  assert.ok(out.every((x) => x.series.every((p) => !Array.isArray(p))));
 });

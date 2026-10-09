@@ -24,7 +24,7 @@ const {
 
 const crypto = require("crypto");
 const { Timestamp } = require("firebase-admin/firestore");
-const { bucketByMinute, daysBetween, heartRateSamples, summarizeWorkout } = require("./lib/heartRate");
+const { bucketByMinute, daysBetween, exerciseHeartRates, heartRateSamples, summarizeWorkout } = require("./lib/heartRate");
 
 admin.initializeApp();
 
@@ -1096,7 +1096,9 @@ async function syncWorkoutHeartRate(uid, workouts) {
     const summary = summarizeWorkout(minutes, startMs, endMs);
     const ref = db.doc(`users/${uid}/workoutHeartRate/${w.id}`);
     if (summary) {
-      await ref.set({ ...summary, startedAtMs: startMs, finishedAtMs: endMs, source: "Apple Health", updatedAtMs: Date.now() });
+      // Each exercise's own heart rate too, from its first to its last logged set.
+      const exercises = exerciseHeartRates(minutes, w.exercises);
+      await ref.set({ ...summary, exercises, startedAtMs: startMs, finishedAtMs: endMs, source: "Apple Health", updatedAtMs: Date.now() });
       written += 1;
     }
   }
