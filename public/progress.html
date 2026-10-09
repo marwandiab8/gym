@@ -20,6 +20,7 @@
   <link rel="modulepreload" href="js/setScoring.js" />
   <link rel="modulepreload" href="js/workoutSession.js" />
   <link rel="modulepreload" href="js/prRecords.js" />
+  <link rel="modulepreload" href="js/progressStats.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js" />
@@ -123,22 +124,21 @@
     </nav>
   </div>
 
-  <main class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-    <div class="lg:col-span-12">
-      <div class="bg-[#111] border border-zinc-800 rounded-3xl p-6 md:p-8">
-        <h2 class="text-2xl font-bold mb-6 flex items-center gap-3"><i class="fa-solid fa-arrow-trend-up text-blue-500"></i> Progress Charts</h2>
-        <div class="flex flex-wrap md:flex-nowrap gap-3 mb-6">
-          <select id="chartExerciseSelect" class="flex-1 bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-blue-500 appearance-none"></select>
-        </div>
-        <div class="w-full h-[300px] relative overflow-hidden rounded-xl border border-zinc-800/60 bg-zinc-950/40">
-          <canvas id="progressChart" class="h-full w-full"></canvas>
-          <div
-            id="progressChartEmpty"
-            class="hidden absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-zinc-500 leading-relaxed"
-            role="status"
-          ></div>
-        </div>
+  <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+    <div class="mb-4 flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 class="flex items-center gap-3 text-2xl font-bold"><i class="fa-solid fa-arrow-trend-up text-emerald-400"></i> Progress</h1>
+        <p class="mt-1 max-w-2xl text-sm text-zinc-400">Are you getting stronger, training consistently, and giving every muscle enough work?</p>
       </div>
+      <div id="progressPeriod" role="group" aria-label="Period" class="flex rounded-xl border border-zinc-800 bg-zinc-900 p-1 text-sm">
+        <button type="button" data-period="4" class="rounded-lg px-3 py-1.5 font-semibold text-zinc-400">4 wks</button>
+        <button type="button" data-period="12" class="rounded-lg px-3 py-1.5 font-semibold text-zinc-400">12 wks</button>
+        <button type="button" data-period="26" class="rounded-lg px-3 py-1.5 font-semibold text-zinc-400">6 mo</button>
+        <button type="button" data-period="all" class="rounded-lg px-3 py-1.5 font-semibold text-zinc-400">All</button>
+      </div>
+    </div>
+    <div id="progressPage" aria-live="polite">
+      <div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Loading your progress…</div>
     </div>
   </main>
 

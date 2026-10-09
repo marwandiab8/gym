@@ -8,10 +8,9 @@ import {
   isCompletedSet,
   isNewPRBeatsCurrent,
   prSetVolume,
-  chartPeakFromSummary,
-  chartPeakFromRawExercise,
 } from "./js/setScoring.js";
 import { PR_GROUPS, buildPrRecords, daysBetweenKeys } from "./js/prRecords.js";
+import { buildProgress } from "./js/progressStats.js";
 import {
   applyDraftDateChoice,
   buildDateCorrectionRequest,
@@ -59,7 +58,6 @@ const els = {
   userLabel: document.getElementById("userLabel"), signInBtn: document.getElementById("loginBtn"), signOutBtn: document.getElementById("logoutBtn"), searchInput: document.getElementById("searchInput"), searchBtn: document.getElementById("searchBtn"), createCustomExerciseBtn: document.getElementById("createCustomExerciseBtn"), searchResults: document.getElementById("searchResults"), dateInput: document.getElementById("dateInput"), unitSelect: document.getElementById("unitSelect"), startWorkoutBtn: document.getElementById("startWorkoutBtn"), finishWorkoutBtn: document.getElementById("finishWorkoutBtn"), resumeDraftBtn: document.getElementById("resumeDraftBtn"), discardWorkoutBtn: document.getElementById("discardWorkoutBtn"), saveTemplateBtn: document.getElementById("saveTemplateBtn"), updateTemplateBtn: document.getElementById("updateTemplateBtn"), templatesList: document.getElementById("templatesList"), saveStatus: document.getElementById("saveStatus"), workoutExercises: document.getElementById("workoutExercises"), prsList: document.getElementById("prsList"), analyticsContent: document.getElementById("analyticsContent"), recentWorkouts: document.getElementById("recentWorkouts"), recentWorkoutsPreview: document.getElementById("recentWorkoutsPreview"), loadMoreWorkoutsBtn: document.getElementById("loadMoreWorkoutsBtn"),
   workoutModal: document.getElementById("workoutModal"), modalTitle: document.getElementById("modalTitle"), modalContent: document.getElementById("modalContent"), closeModalBtn: document.getElementById("closeModalBtn"),
   toggleTimerBtn: document.getElementById("toggleTimerBtn"), restTimerWidget: document.getElementById("restTimerWidget"), timerDisplay: document.getElementById("timerDisplay"), timerAddBtn: document.getElementById("timerAddBtn"), timerPlayPauseBtn: document.getElementById("timerPlayPauseBtn"), timerStopBtn: document.getElementById("timerStopBtn"), timerCloseBtn: document.getElementById("timerCloseBtn"),
-  chartExerciseSelect: document.getElementById("chartExerciseSelect"),
   templateModal: document.getElementById("templateModal"), closeTemplateModalBtn: document.getElementById("closeTemplateModalBtn"), editTemplateName: document.getElementById("editTemplateName"), editTemplateExercises: document.getElementById("editTemplateExercises"), saveTemplateChangesBtn: document.getElementById("saveTemplateChangesBtn"), deleteTemplateModalBtn: document.getElementById("deleteTemplateModalBtn"),
   aiModal: document.getElementById("aiModal"), openAiModalBtn: document.getElementById("openAiModalBtn"), openAiModalBtnRoutines: document.getElementById("openAiModalBtnRoutines"), closeAiModalBtn: document.getElementById("closeAiModalBtn"), aiPromptInput: document.getElementById("aiPromptInput"), generateAiBtn: document.getElementById("generateAiBtn"), aiPreviewWrap: document.getElementById("aiPreviewWrap"), aiPreviewList: document.getElementById("aiPreviewList"), aiPreviewActions: document.getElementById("aiPreviewActions"), applyAiPreviewBtn: document.getElementById("applyAiPreviewBtn"), discardAiPreviewBtn: document.getElementById("discardAiPreviewBtn"),
   workoutNotesWrap: document.getElementById("workoutNotesWrap"), workoutNotesInput: document.getElementById("workoutNotesInput"),
@@ -836,7 +834,7 @@ async function completeWorkoutFromDraft() {
     setAuthUI();
     updateResumeDraftButtonState().catch(() => {});
     loadAnalytics().catch(() => {});
-    populateDropdowns().catch(() => {});
+    loadProgressPage().catch(() => {});
     refreshRecentWorkoutsPage({ reset: true, renderLoading: false }).catch(() => {});
     scheduleAnalyticsRefresh();
   } catch (e) {
@@ -1185,6 +1183,7 @@ onAuthStateChanged(auth, async (user) => {
     if (els.healthStatus) els.healthStatus.textContent = "Sign in to set this up.";
     renderRecentWorkoutsSignedOut();
     renderPrsSignedOut();
+    renderProgressSignedOut();
     handleRouteChange();
     return;
   }
@@ -1200,7 +1199,7 @@ onAuthStateChanged(auth, async (user) => {
   setAuthUI();
   setActiveBadge();
   renderWorkoutBuilder();
-  await runBootstrapStep("dropdowns", () => populateDropdowns());
+  await runBootstrapStep("progress page", () => loadProgressPage());
   await runBootstrapStep("draft cleanup", () => purgeEmptyStaleDrafts());
   await runBootstrapStep("resume button", () => updateResumeDraftButtonState());
   await runBootstrapStep("draft recovery", () => offerDraftRecoveryIfNeeded());
@@ -1597,7 +1596,7 @@ function addExerciseToWorkout(id, name) {
   if (workoutState.exercises.some(e => e.exerciseId === id)) return setStatus("Already added");
   const exerciseEntry = { exerciseId: id, name, exerciseNote: "", sets: [{weight:"", reps:"", rpe:""}], lastSets: [], addedAt: Date.now(), firstEditTime: null, lastEditTime: null };
   workoutState.exercises.push(exerciseEntry);
-  renderWorkoutBuilder(); populateDropdowns(); scheduleAutosave();
+  renderWorkoutBuilder(); scheduleAutosave();
 }
 
 async function findOrCreateExerciseId(name) {
@@ -1704,8 +1703,6 @@ function hydrateExerciseProgressReference(exercise) {
 
 function invalidateFinalSetsCache(exerciseIds = []) {
   finalHistoryPages = { uid: null, pages: [] };
-  chartWorkoutsSample = [];
-  chartWorkoutsLoadPromise = null;
   exerciseProgressCache.clear();
   clearLocalExerciseProgress(exerciseIds);
 }
@@ -2416,6 +2413,8 @@ async function loadPrsPage() {
     const data = buildPrRecords(workouts, { completedSets: completedExerciseSetRows, today: localCalendarDateKey() });
     prPage = { data, group: "All", sort: "group", search: "", showOneOffs: false, recentShown: 9 };
     renderPrsPage();
+    const linked = location.hash.match(/^#ex=(.+)$/);
+    if (linked) openPrDetail(decodeURIComponent(linked[1]));
   } catch (e) {
     console.error("PR page load failed", e);
     els.prsList.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your workouts. Check your connection and reload the page.</div>`;
@@ -2725,8 +2724,6 @@ document.getElementById("prDetailDialog")?.addEventListener("click", (event) => 
 });
 
 let analyticsWindowWorkouts = [];
-let chartWorkoutsSample = [];
-let chartWorkoutsLoadPromise = null;
 
 function workoutSummariesCollection() {
   return collection(db, "users", currentUser.uid, "workout_summaries");
@@ -2769,49 +2766,8 @@ function mergeWorkoutLikeRecords(...lists) {
   return [...byId.values()];
 }
 
-async function loadChartWorkoutsSample() {
-  if (!currentUser) return [];
-  if (chartWorkoutsSample.length) return chartWorkoutsSample;
-  if (!chartWorkoutsLoadPromise) {
-    chartWorkoutsLoadPromise = (async () => {
-      let summaryRows = [];
-      let rawRows = [];
-      try {
-        const summarySnap = await getDocs(
-          query(workoutSummariesCollection(), orderBy("updatedAtMs", "desc"), limit(120))
-        );
-        summaryRows = summarySnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      } catch (e) {
-        console.warn("Chart workout summary query failed", e);
-      }
-      try {
-        const rawSnap = await getDocs(
-          query(
-            collection(db, "users", currentUser.uid, "workouts"),
-            where("status", "==", "final"),
-            orderBy("updatedAtMs", "desc"),
-            limit(120)
-          )
-        );
-        rawRows = rawSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      } catch (e) {
-        console.warn("Chart raw workout query failed", e);
-      } finally {
-        chartWorkoutsSample = mergeWorkoutLikeRecords(summaryRows, rawRows)
-          .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0))
-          .slice(0, 120);
-        chartWorkoutsLoadPromise = null;
-      }
-      return chartWorkoutsSample;
-    })();
-  }
-  return chartWorkoutsLoadPromise;
-}
-
 function resetWorkoutAnalyticsCaches() {
   analyticsWindowWorkouts = [];
-  chartWorkoutsSample = [];
-  chartWorkoutsLoadPromise = null;
 }
 
 function scheduleAnalyticsRefresh(delayMs = 1500) {
@@ -3974,88 +3930,328 @@ els.timerCloseBtn?.addEventListener("click", () => {
   persistTimerState();
 });
 
-// ==================== CHARTS ====================
-let myChart = null;
+// ==================== PROGRESS PAGE ====================
+// Strength, consistency and muscle balance over a period, against the period before (js/progressStats.js).
+const PROGRESS_GROUP_COLORS = { Legs: "#3b82f6", Chest: "#f97316", Back: "#10b981", Shoulders: "#a855f7", Arms: "#ec4899", Core: "#eab308", Other: "#71717a" };
+const PROGRESS_PERIODS = { 4: "4 weeks", 12: "12 weeks", 26: "6 months", all: "all time" };
+let progressState = null;
+const progressCharts = { weekly: null, exercise: null };
 
-async function refreshProgressChartIfPresent() {
-  const canvas = document.getElementById("progressChart");
-  if (!canvas || !els.chartExerciseSelect) return;
-  await loadChartWorkoutsSample();
-  if (els.chartExerciseSelect.value) updateProgressChart(els.chartExerciseSelect.value);
-}
-
-async function populateDropdowns() {
-  if (!currentUser) return;
+async function loadProgressPage() {
+  const box = document.getElementById("progressPage");
+  if (!currentUser || !box) return;
+  if (!progressState) box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Loading your progress…</div>`;
   try {
-    const q = query(collection(db, "users", currentUser.uid, "prs"), limit(400));
-    const snap = await getDocs(q);
-    let options = `<option value="">${snap.empty ? "No PRs yet — finish a workout first" : "Select an exercise…"}</option>`;
-    snap.forEach(d => { options += `<option value="${d.data().exerciseId}">${escapeHtml(d.data().exerciseName)}</option>`; });
-    if (els.chartExerciseSelect) els.chartExerciseSelect.innerHTML = options;
-    await refreshProgressChartIfPresent();
-  } catch (e) { console.error("Dropdown populate error", e); }
-}
-
-function setProgressChartEmpty(visible, message = "") {
-  const empty = document.getElementById("progressChartEmpty");
-  if (empty) {
-    empty.textContent = message;
-    empty.classList.toggle("hidden", !visible);
+    const snap = await getDocs(query(
+      collection(db, "users", currentUser.uid, "workouts"),
+      where("status", "==", "final"),
+      orderBy("updatedAtMs", "desc"),
+      limit(2000)
+    ));
+    const workouts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const today = localCalendarDateKey();
+    const records = buildPrRecords(workouts, { completedSets: completedExerciseSetRows, today });
+    progressState = { workouts, records, today, period: progressState?.period || "12", exerciseId: progressState?.exerciseId || "", showAllLifts: false };
+    renderProgressPage();
+  } catch (e) {
+    console.error("Progress page load failed", e);
+    box.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your workouts. Check your connection and reload the page.</div>`;
   }
 }
 
-function updateProgressChart(exerciseId) {
-    const canvas = document.getElementById("progressChart");
-    if (!canvas || !els.chartExerciseSelect) return;
-    if (!exerciseId) {
-      if (myChart) { myChart.destroy(); myChart = null; }
-      setProgressChartEmpty(true, "Select an exercise to see best set volume over time (weight × reps; bodyweight counts reps).");
-      return;
-    }
-    if (chartWorkoutsSample.length === 0) {
-      if (myChart) { myChart.destroy(); myChart = null; }
-      setProgressChartEmpty(true, "No workouts loaded yet. Sign in and complete a session, then return to Progress.");
-      return;
-    }
-    const dataPoints = [];
-    chartWorkoutsSample.forEach((w) => {
-        let displayDate = w.date; if (displayDate && String(displayDate).length > 10 && !String(displayDate).includes("-")) displayDate = toLocalISODate(new Date(Number(displayDate)));
-        const summaryMatch = (w.exerciseSummaries || []).find((e) => e.exerciseId === exerciseId);
-        const fromSummary = chartPeakFromSummary(summaryMatch);
-        if (fromSummary && fromSummary.volume > 0) {
-            dataPoints.push({ date: displayDate, volume: fromSummary.volume });
-            return;
-        }
-        const rawExercise = (w.exercises || []).find((e) => e.exerciseId === exerciseId);
-        const fromRaw = chartPeakFromRawExercise(rawExercise);
-        if (fromRaw && fromRaw.volume > 0) {
-            dataPoints.push({ date: displayDate, volume: fromRaw.volume });
-        }
-    });
-    dataPoints.sort((a, b) => new Date(a.date) - new Date(b.date));
-    if (dataPoints.length === 0) {
-      if (myChart) {
-        myChart.destroy();
-        myChart = null;
-      }
-      setProgressChartEmpty(true, "No volume history for this exercise in these workouts. Finish more logged sessions or pick another lift.");
-      return;
-    }
-    setProgressChartEmpty(false);
-    const labels = dataPoints.map(dp => dp.date); const volumes = dataPoints.map(dp => dp.volume);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    if (myChart) myChart.destroy();
-    if (typeof Chart === "undefined") return;
-    myChart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: labels, datasets: [{ label: 'Best set volume (weight × reps; reps only if no load)', data: volumes, borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', borderWidth: 3, pointBackgroundColor: '#10b981', pointBorderColor: '#fff', pointRadius: 5, fill: true, tension: 0.3 }] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { title: { display: true, text: 'Volume', color: '#71717a' }, grid: { color: '#27272a' }, ticks: { color: '#a1a1aa' } }, x: { grid: { display: false }, ticks: { color: '#a1a1aa' } } } }
-    });
+function renderProgressSignedOut() {
+  const box = document.getElementById("progressPage");
+  if (box) box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Log in to see your progress.</div>`;
 }
-els.chartExerciseSelect?.addEventListener("change", async (e) => {
-  await loadChartWorkoutsSample();
-  updateProgressChart(e.target.value);
+
+const progressFmt = (n, digits = 0) => (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
+const progressPct = (change) => {
+  const pct = Math.round(change * 100);
+  return pct === 0 ? "0%" : `${pct > 0 ? "+" : "−"}${Math.abs(pct)}%`;
+};
+
+// "+16% vs before" in green, or "−8% vs before" in amber, comparing two per-week numbers.
+function progressDelta(now, before, { unit = "", digits = 0 } = {}) {
+  if (before == null) return "";
+  if (!before) return now ? `<span class="text-emerald-400">new</span>` : "";
+  const change = (now - before) / before;
+  const cls = change >= 0.03 ? "text-emerald-400" : change <= -0.03 ? "text-amber-300" : "text-zinc-400";
+  const arrow = change >= 0.03 ? "fa-arrow-up" : change <= -0.03 ? "fa-arrow-down" : "fa-equals";
+  return `<span class="${cls}"><i class="fa-solid ${arrow} mr-1"></i>${progressPct(change)}</span> <span class="text-zinc-500">(was ${progressFmt(before, digits)}${unit})</span>`;
+}
+
+function renderProgressPage() {
+  const box = document.getElementById("progressPage");
+  if (!box || !progressState) return;
+  document.querySelectorAll("#progressPeriod [data-period]").forEach((b) => {
+    const active = b.getAttribute("data-period") === progressState.period;
+    b.setAttribute("aria-pressed", String(active));
+    b.className = `rounded-lg px-3 py-1.5 font-semibold transition ${active ? "bg-emerald-500/15 text-emerald-300" : "text-zinc-400 hover:text-zinc-200"}`;
+  });
+  const weeks = progressState.period === "all" ? null : Number(progressState.period);
+  const p = buildProgress(progressState.workouts, progressState.records, { today: progressState.today, weeks, completedSets: completedExerciseSetRows });
+  progressState.stats = p;
+  if (!p) {
+    box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">No finished workouts yet. Your progress shows up here once you've logged a few.</div>`;
+    return;
+  }
+  const since = prShortDate(p.range.start);
+  const prev = p.previous;
+  const s = p.strength;
+  const tile = (label, value, sub) => `<div class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4"><div class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">${label}</div><div class="mt-1 text-2xl font-black text-white">${value}</div><div class="mt-1 space-y-0.5 text-xs leading-snug text-zinc-400">${sub}</div></div>`;
+  const strengthCls = s.change == null ? "text-white" : s.change >= 0.01 ? "text-emerald-400" : s.change <= -0.01 ? "text-amber-300" : "text-white";
+  const tiles = [
+    tile("Strength", `<span class="${strengthCls}">${s.change == null ? "—" : progressPct(s.change)}</span>`,
+      s.lifts ? `<div>typical change across ${s.lifts} lifts since ${since}</div><div><span class="text-emerald-400">${s.up} up</span> · <span class="${s.down ? "text-amber-300" : ""}">${s.down} down</span> · ${s.lifts - s.up - s.down} level</div>` : `<div>needs a few sessions of the same lifts</div>`),
+    tile("Workouts a week", progressFmt(p.current.perWeek, 1),
+      `<div>${p.current.workouts} since ${since}${p.current.averageMinutes ? ` · about ${p.current.averageMinutes} min each` : ""}</div>${prev ? `<div>${progressDelta(p.current.perWeek, prev.perWeek, { digits: 1 })}</div>` : ""}<div>${p.streak.weeks ? `<i class="fa-solid fa-fire mr-1 text-orange-400"></i>${p.streak.weeks} week${p.streak.weeks === 1 ? "" : "s"} in a row with ${p.streak.minWorkouts}+` : `No current streak of ${p.streak.minWorkouts}+ a week`}</div>`),
+    tile("Sets a week", progressFmt(p.current.setsPerWeek),
+      `<div>${progressFmt(p.current.setsPerWorkout, 1)} per workout</div>${prev ? `<div>${progressDelta(p.current.setsPerWeek, prev.setsPerWeek)}</div>` : ""}`),
+    tile("Lifted a week", `${progressFmt(p.current.volumePerWeek / 1000, 1)}k <span class="text-base font-semibold text-zinc-500">lb</span>`,
+      `<div>weight × reps, all sets</div>${prev ? `<div>${progressDelta(p.current.volumePerWeek / 1000, prev.volumePerWeek / 1000, { unit: "k", digits: 1 })}</div>` : ""}`),
+  ].join("");
+  const compareNote = prev
+    ? `Compared with the ${progressFmt(p.range.previousWeeks)} weeks before (from ${prShortDate(p.range.previousStart)}).`
+    : weeks ? "Not enough history before this period to compare with." : "";
+
+  box.innerHTML = `
+    <div class="mb-3 text-xs text-zinc-500">${prShortDate(p.range.start)} – ${prShortDate(p.range.end)}. ${compareNote}</div>
+    <section class="grid grid-cols-2 gap-3 lg:grid-cols-4">${tiles}</section>
+    <section class="mt-8">
+      <div class="mb-1 flex items-baseline justify-between gap-3"><h2 class="text-lg font-bold text-zinc-100">Your lifts</h2><a href="prs.html" class="text-xs font-semibold text-emerald-400 hover:text-emerald-300">Records <i class="fa-solid fa-arrow-right ml-1"></i></a></div>
+      <p class="mb-3 text-xs leading-relaxed text-zinc-500">Where each lift is now against where it was when this period began. "Level" is your best estimated 1-rep max over the last 3 sessions (most reps for bodyweight moves), so one off day doesn't count.</p>
+      <div id="progressLifts"></div>
+    </section>
+    <section class="mt-8">
+      <h2 class="text-lg font-bold text-zinc-100">Sets each week</h2>
+      <p class="mb-3 text-xs text-zinc-500">Coloured by muscle group. Tap a bar for that week's workouts and weight lifted.</p>
+      <div class="relative h-64 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-3"><canvas id="progressWeeklyChart"></canvas></div>
+    </section>
+    <section class="mt-8">
+      <h2 class="text-lg font-bold text-zinc-100">Muscle balance</h2>
+      <p class="mb-3 text-xs leading-relaxed text-zinc-500">Average sets a week for each muscle group. Only direct work counts: a bench press counts for Chest, not for triceps. A common guide for growth is about 10–20 hard sets per muscle a week (the green band).</p>
+      <div id="progressGroups" class="space-y-2"></div>
+    </section>
+    <section class="mt-8">
+      <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-lg font-bold text-zinc-100">One exercise over time</h2>
+        <select id="progressExerciseSelect" aria-label="Exercise" class="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none sm:w-80"></select>
+      </div>
+      <div id="progressExerciseSummary" class="mb-2 text-xs text-zinc-400"></div>
+      <div class="relative h-72 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-3"><canvas id="progressExerciseChart"></canvas><div id="progressExerciseEmpty" class="absolute inset-0 hidden items-center justify-center p-6 text-center text-sm text-zinc-500"></div></div>
+    </section>`;
+  renderProgressLifts();
+  renderProgressGroups();
+  renderProgressWeeklyChart();
+  renderProgressExerciseSelect();
+  renderProgressExerciseChart();
+}
+
+function renderProgressLifts() {
+  const listBox = document.getElementById("progressLifts");
+  const p = progressState?.stats;
+  if (!listBox || !p) return;
+  if (!p.lifts.length) {
+    listBox.innerHTML = `<div class="rounded-xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">No lifts in this period.</div>`;
+    return;
+  }
+  const shown = progressState.showAllLifts ? p.lifts : p.lifts.slice(0, 10);
+  const level = (l, v) => (l.bodyweight ? `${Math.round(v)} reps` : `${Math.round(v)} ${l.unit}`);
+  const rows = shown.map((l) => {
+    const change = l.change == null
+      ? `<span class="rounded-full border border-zinc-700 px-2 py-0.5 text-[11px] font-semibold text-zinc-400">${l.sessions < 5 && !l.from ? "Too new" : "New"}</span>`
+      : `<span class="rounded-full border px-2 py-0.5 text-xs font-bold ${l.change >= 0.01 ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300" : l.change <= -0.01 ? "border-amber-400/30 bg-amber-400/10 text-amber-300" : "border-zinc-700 text-zinc-300"}">${progressPct(l.change)}</span>`;
+    const color = l.change == null ? "#71717a" : l.change >= 0.01 ? "#34d399" : l.change <= -0.01 ? "#fbbf24" : "#a1a1aa";
+    const fromTo = l.from ? `${level(l, l.from)} <i class="fa-solid fa-arrow-right mx-1 text-[10px] text-zinc-600"></i> <b class="text-zinc-100">${level(l, l.now)}</b>` : `<b class="text-zinc-100">${level(l, l.now)}</b>`;
+    return `
+      <a href="prs.html#ex=${encodeURIComponent(l.id)}" class="flex flex-col gap-2 rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 transition hover:border-zinc-600 sm:flex-row sm:items-center sm:gap-4">
+        <div class="flex min-w-0 flex-1 items-start justify-between gap-3">
+          <div class="min-w-0"><div class="font-semibold leading-snug text-zinc-100 sm:truncate">${escapeHtml(l.name)}</div><div class="text-xs text-zinc-500"><span style="color:${PROGRESS_GROUP_COLORS[l.group]}">●</span> ${l.group} · ${l.sessions} session${l.sessions === 1 ? "" : "s"}${l.prs ? ` · ${l.prs} PR${l.prs === 1 ? "" : "s"}` : ""}</div></div>
+          <div class="sm:hidden">${change}</div>
+        </div>
+        <div class="flex items-center justify-between gap-4">
+          <div class="text-sm text-zinc-400 sm:w-48 sm:text-right">${fromTo}</div>
+          ${prSparkline(l.trend, color, 80, 24)}
+          <div class="hidden w-16 justify-end sm:flex">${change}</div>
+        </div>
+      </a>`;
+  }).join("");
+  const more = p.lifts.length > 10
+    ? `<button type="button" data-progress-all-lifts class="mt-3 w-full rounded-xl border border-zinc-800 py-2.5 text-sm font-semibold text-zinc-400 transition hover:border-zinc-600 hover:text-white">${progressState.showAllLifts ? "Show the top 10" : `Show all ${p.lifts.length} lifts`}</button>`
+    : "";
+  listBox.innerHTML = `<div class="space-y-2">${rows}</div>${more}`;
+}
+
+function renderProgressGroups() {
+  const listBox = document.getElementById("progressGroups");
+  const p = progressState?.stats;
+  if (!listBox || !p) return;
+  const scale = Math.max(30, ...p.groups.map((g) => g.setsPerWeek)) * 1.05;
+  listBox.innerHTML = p.groups.map((g) => {
+    const v = g.setsPerWeek;
+    const guided = g.group !== "Core" && g.group !== "Other";
+    const tag = !guided ? "" : v < 10
+      ? `<span class="text-amber-300">below 10</span>`
+      : v > 20 ? `<span class="text-sky-300">above 20</span>` : `<span class="text-emerald-400">in range</span>`;
+    const band = guided ? `<div class="absolute inset-y-0 rounded bg-emerald-500/10 ring-1 ring-inset ring-emerald-500/20" style="left:${(10 / scale) * 100}%;width:${(10 / scale) * 100}%"></div>` : "";
+    const was = g.previousSetsPerWeek == null ? "" : ` · was ${progressFmt(g.previousSetsPerWeek, 1)}`;
+    const last = g.daysSince == null ? "" : g.daysSince === 0 ? "trained today" : g.daysSince === 1 ? "trained yesterday" : `trained ${g.daysSince} days ago`;
+    return `
+      <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3">
+        <div class="mb-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <span class="font-semibold text-zinc-100"><span style="color:${PROGRESS_GROUP_COLORS[g.group]}">●</span> ${g.group}</span>
+          <span class="text-xs text-zinc-400"><b class="text-sm text-zinc-100">${progressFmt(v, 1)}</b> sets a week${tag ? ` · ${tag}` : ""}${was}</span>
+        </div>
+        <div class="relative h-2.5 overflow-hidden rounded bg-zinc-800">${band}<div class="absolute inset-y-0 left-0 rounded" style="width:${Math.min(100, (v / scale) * 100)}%;background:${PROGRESS_GROUP_COLORS[g.group]};opacity:.85"></div></div>
+        <div class="mt-1.5 text-[11px] ${g.daysSince != null && g.daysSince > 10 ? "text-amber-300" : "text-zinc-500"}">${last}</div>
+      </div>`;
+  }).join("");
+}
+
+function progressChartReady() {
+  return typeof Chart !== "undefined";
+}
+
+function renderProgressWeeklyChart() {
+  const canvas = document.getElementById("progressWeeklyChart");
+  const p = progressState?.stats;
+  if (!canvas || !p) return;
+  if (progressCharts.weekly) progressCharts.weekly.destroy();
+  progressCharts.weekly = null;
+  if (!progressChartReady()) return;
+  const groups = PR_GROUPS.filter((g) => p.weekly.some((w) => w.byGroup[g]));
+  progressCharts.weekly = new Chart(canvas.getContext("2d"), {
+    type: "bar",
+    data: {
+      labels: p.weekly.map((w) => prShortDate(w.week)),
+      datasets: groups.map((g) => ({ label: g, data: p.weekly.map((w) => w.byGroup[g] || 0), backgroundColor: PROGRESS_GROUP_COLORS[g], borderRadius: 3, stack: "sets" })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { color: "#a1a1aa", boxWidth: 10, boxHeight: 10, font: { size: 11 } } },
+        tooltip: {
+          filter: (item) => item.raw > 0,
+          callbacks: {
+            title: (items) => `Week of ${items[0].label}`,
+            footer: (items) => {
+              const w = p.weekly[items[0].dataIndex];
+              return `${w.workouts} workout${w.workouts === 1 ? "" : "s"} · ${w.sets} sets · ${progressFmt(w.volume / 1000, 1)}k lb`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { color: "#71717a", maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+        y: { stacked: true, grid: { color: "#27272a" }, ticks: { color: "#71717a", precision: 0 }, title: { display: true, text: "Sets", color: "#71717a" } },
+      },
+    },
+  });
+}
+
+function renderProgressExerciseSelect() {
+  const select = document.getElementById("progressExerciseSelect");
+  const p = progressState?.stats;
+  if (!select || !p) return;
+  const inPeriod = new Map(p.lifts.map((l) => [l.id, l.sessions]));
+  const options = progressState.records.exercises
+    .filter((ex) => ex.sessionCount > 1)
+    .sort((a, b) => (inPeriod.get(b.id) || 0) - (inPeriod.get(a.id) || 0) || b.sessionCount - a.sessionCount || a.name.localeCompare(b.name));
+  if (!options.some((ex) => ex.id === progressState.exerciseId)) progressState.exerciseId = options[0]?.id || "";
+  select.innerHTML = PR_GROUPS.map((g) => {
+    const items = options.filter((ex) => ex.group === g);
+    return items.length ? `<optgroup label="${g}">${items.map((ex) => `<option value="${escapeHtml(ex.id)}">${escapeHtml(ex.name)} (${inPeriod.get(ex.id) || 0} in period)</option>`).join("")}</optgroup>` : "";
+  }).join("");
+  select.value = progressState.exerciseId;
+}
+
+function renderProgressExerciseChart() {
+  const canvas = document.getElementById("progressExerciseChart");
+  const empty = document.getElementById("progressExerciseEmpty");
+  const summary = document.getElementById("progressExerciseSummary");
+  const p = progressState?.stats;
+  if (!canvas || !p) return;
+  if (progressCharts.exercise) progressCharts.exercise.destroy();
+  progressCharts.exercise = null;
+  const ex = progressState.records.exercises.find((e) => e.id === progressState.exerciseId);
+  const sessions = ex ? ex.sessions.filter((s) => s.date >= p.range.start && s.date <= p.range.end) : [];
+  const showEmpty = (message) => {
+    if (!empty) return;
+    empty.textContent = message;
+    empty.classList.toggle("hidden", !message);
+    empty.classList.toggle("flex", Boolean(message));
+  };
+  if (!ex) return showEmpty("Pick an exercise.");
+  const lift = p.lifts.find((l) => l.id === ex.id);
+  if (summary) {
+    summary.innerHTML = lift
+      ? `${escapeHtml(ex.name)}: ${lift.sessions} session${lift.sessions === 1 ? "" : "s"} in this period${lift.change != null ? `, ${progressPct(lift.change)} since it began` : ""}${lift.prs ? `, ${lift.prs} PR${lift.prs === 1 ? "" : "s"}` : ""}. <a class="font-semibold text-emerald-400 hover:text-emerald-300" href="prs.html#ex=${encodeURIComponent(ex.id)}">Records</a>`
+      : `${escapeHtml(ex.name)} wasn't done in this period. Last time: ${prShortDate(ex.lastDate)}.`;
+  }
+  if (sessions.length < 2) return showEmpty(sessions.length ? "Only one session in this period. Pick a longer period to see a trend." : "Not done in this period. Pick a longer period.");
+  showEmpty("");
+  if (!progressChartReady()) return;
+  const top = (s) => Math.max(...s.sets.map((set) => Number(set.weight) || 0));
+  const datasets = [{
+    label: ex.bodyweight ? "Most reps" : "Est. 1-rep max",
+    data: sessions.map((s) => s.score),
+    borderColor: "#34d399",
+    backgroundColor: "rgba(52, 211, 153, 0.08)",
+    fill: true,
+    tension: 0.25,
+    borderWidth: 2.5,
+    pointRadius: sessions.map((s) => (s.pr ? 5 : 2.5)),
+    pointBackgroundColor: sessions.map((s) => (s.pr ? "#fbbf24" : "#34d399")),
+    pointBorderColor: sessions.map((s) => (s.pr ? "#111" : "#34d399")),
+  }];
+  if (!ex.bodyweight) {
+    datasets.push({ label: "Heaviest set", data: sessions.map(top), borderColor: "#a1a1aa", borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, tension: 0.25, fill: false });
+  }
+  progressCharts.exercise = new Chart(canvas.getContext("2d"), {
+    type: "line",
+    data: { labels: sessions.map((s) => prShortDate(s.date)), datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { color: "#a1a1aa", boxWidth: 10, boxHeight: 10, font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: (item) => `${item.dataset.label}: ${Math.round(item.raw)}${ex.bodyweight ? " reps" : ` ${ex.unit}`}`,
+            footer: (items) => {
+              const s = sessions[items[0].dataIndex];
+              return [`Sets: ${s.sets.map(prSetText).join(", ")}`, ...(s.pr ? [`PR: ${PR_KINDS[s.pr]?.label || "PR"}`] : [])];
+            },
+          },
+        },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: "#71717a", maxRotation: 0, autoSkip: true, maxTicksLimit: 7 } },
+        y: { grid: { color: "#27272a" }, ticks: { color: "#71717a" }, title: { display: true, text: ex.bodyweight ? "Reps" : ex.unit, color: "#71717a" } },
+      },
+    },
+  });
+}
+
+document.getElementById("progressPeriod")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-period]");
+  if (!button || !progressState) return;
+  progressState.period = button.getAttribute("data-period");
+  progressState.showAllLifts = false;
+  renderProgressPage();
+});
+document.getElementById("progressPage")?.addEventListener("click", (event) => {
+  if (!progressState || !event.target.closest("[data-progress-all-lifts]")) return;
+  progressState.showAllLifts = !progressState.showAllLifts;
+  renderProgressLifts();
+});
+document.getElementById("progressPage")?.addEventListener("change", (event) => {
+  if (!progressState || event.target.id !== "progressExerciseSelect") return;
+  progressState.exerciseId = event.target.value;
+  renderProgressExerciseChart();
 });
 
 els.mobileMenuBtn?.addEventListener("click", () => {

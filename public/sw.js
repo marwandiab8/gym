@@ -9,7 +9,7 @@
  */
 
 // BEGIN STAMP
-const BUILD_ID = "99e5a65431fc";
+const BUILD_ID = "be9daf93d49f";
 const PRECACHE = [
   "/app.js",
   "/apple-touch-icon.png",
@@ -18,6 +18,7 @@ const PRECACHE = [
   "/icon-512.png",
   "/index.html",
   "/js/prRecords.js",
+  "/js/progressStats.js",
   "/js/setScoring.js",
   "/js/workoutSession.js",
   "/k2_logo.png",

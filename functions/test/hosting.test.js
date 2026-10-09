@@ -38,7 +38,7 @@ test("every page starts its downloads early and registers the service worker", (
   const appUrl = read("index.html").match(/src="(app\.js\?v=[^"]+)"/)[1];
   for (const page of pages) {
     const html = read(page);
-    for (const href of [appUrl, "js/setScoring.js", "js/workoutSession.js", "js/prRecords.js", "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js"]) {
+    for (const href of [appUrl, "js/setScoring.js", "js/workoutSession.js", "js/prRecords.js", "js/progressStats.js", "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js"]) {
       assert.ok(html.includes(`<link rel="modulepreload" href="${href}" />`), `${page} should modulepreload ${href}`);
     }
     assert.match(html, /navigator\.serviceWorker\.register\("\/sw\.js"\)/, `${page} registers the service worker`);
