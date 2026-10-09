@@ -11,6 +11,7 @@ import {
   chartPeakFromSummary,
   chartPeakFromRawExercise,
 } from "./js/setScoring.js";
+import { PR_GROUPS, buildPrRecords, daysBetweenKeys } from "./js/prRecords.js";
 import {
   applyDraftDateChoice,
   buildDateCorrectionRequest,
@@ -1183,6 +1184,7 @@ onAuthStateChanged(auth, async (user) => {
     workoutHeartRates.clear();
     if (els.healthStatus) els.healthStatus.textContent = "Sign in to set this up.";
     renderRecentWorkoutsSignedOut();
+    renderPrsSignedOut();
     handleRouteChange();
     return;
   }
@@ -1190,7 +1192,7 @@ onAuthStateChanged(auth, async (user) => {
     setDoc(doc(db, "users", currentUser.uid), { lastSeen: serverTimestamp() }, { merge: true })
   );
   await runBootstrapStep("favorites", () => initFavoriteExercisesForUser());
-  runBootstrapStep("prs listener", async () => listenToPRs());
+  runBootstrapStep("prs page", async () => loadPrsPage());
   runBootstrapStep("analytics", () => loadAnalytics());
   runBootstrapStep("templates", () => loadTemplates());
   runBootstrapStep("integrity check", () => runIntegrityCheckIfDue());
@@ -2396,29 +2398,331 @@ function renderWorkoutBuilder() {
 }
 
 // ==================== PRS, ANALYTICS & CHARTS ====================
-let unsubPRs = null;
-function listenToPRs() {
-  if (unsubPRs) {
-    unsubPRs();
-    unsubPRs = null;
-  }
+// Records are worked out from every finished workout (js/prRecords.js), so they always match the workouts:
+// fixing a set in a workout fixes its records.
+let prPage = null;
+
+async function loadPrsPage() {
   if (!currentUser || !els.prsList) return;
-  const q = query(collection(db, "users", currentUser.uid, "prs"), limit(500));
-  unsubPRs = onSnapshot(q, (snap) => {
-    if (!els.prsList) return;
-    els.prsList.innerHTML = "";
-    if (snap.empty) {
-      els.prsList.innerHTML = `<div class="text-zinc-500 col-span-full rounded-xl border border-dashed border-zinc-800 py-10 px-4 text-center text-sm leading-relaxed">No PRs yet. Finish a workout with at least one set that has reps (and weight for loaded lifts) to record bests by volume.</div>`;
-      return;
-    }
-    snap.forEach(d => {
-      const pr = d.data(); const div = document.createElement("div"); div.className = "bg-zinc-800 p-5 rounded-2xl flex justify-between items-center border border-zinc-700 group";
-      div.innerHTML = `<div class="flex-1"><div class="font-bold text-lg text-zinc-100">${escapeHtml(pr.exerciseName)}</div><div class="text-xs text-zinc-400">${escapeHtml(pr.date || "N/A")}</div></div><div class="text-right text-yellow-500 font-black text-2xl tracking-tighter mr-4">${pr.weight}<span class="text-sm font-medium text-yellow-600 ml-1">× ${pr.reps}</span></div><button class="deletePrBtn text-zinc-600 hover:text-red-500 transition-colors p-2 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100" title="Delete PR"><i class="fa-solid fa-trash"></i></button>`;
-      div.querySelector(".deletePrBtn").onclick = async () => { if (confirm(`Delete your PR for ${pr.exerciseName}?`)) { try { await deleteDoc(doc(db, "users", currentUser.uid, "prs", pr.exerciseId)); populateDropdowns(); setStatus("PR deleted.", "info"); } catch (e) { alert("Failed to delete PR."); } } };
-      els.prsList.appendChild(div);
-    });
-  });
+  els.prsList.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Loading your records…</div>`;
+  try {
+    const snap = await getDocs(query(
+      collection(db, "users", currentUser.uid, "workouts"),
+      where("status", "==", "final"),
+      orderBy("updatedAtMs", "desc"),
+      limit(2000)
+    ));
+    const workouts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const data = buildPrRecords(workouts, { completedSets: completedExerciseSetRows, today: localCalendarDateKey() });
+    prPage = { data, group: "All", sort: "group", search: "", showOneOffs: false, recentShown: 9 };
+    renderPrsPage();
+  } catch (e) {
+    console.error("PR page load failed", e);
+    els.prsList.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your workouts. Check your connection and reload the page.</div>`;
+  }
 }
+
+function renderPrsSignedOut() {
+  if (els.prsList) els.prsList.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Log in to see your personal records.</div>`;
+}
+
+const prNum = (n) => String(Math.round((Number(n) || 0) * 10) / 10);
+const prSetText = (s) => (s ? (Number(s.weight) > 0 ? `${prNum(s.weight)} ${s.unit} × ${s.reps}` : `${s.reps} reps`) : "");
+
+function prShortDate(key) {
+  if (!key) return "";
+  const [y, m, d] = key.split("-").map(Number);
+  const sameYear = y === new Date().getFullYear();
+  return new Date(y, m - 1, d, 12).toLocaleDateString(undefined, { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }) });
+}
+
+function prDaysAgo(key) {
+  const days = daysBetweenKeys(key, localCalendarDateKey());
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  return `${days} days ago`;
+}
+
+const PR_KINDS = {
+  heaviest: { label: "Heaviest ever", cls: "border-amber-400/30 bg-amber-400/10 text-amber-300", icon: "fa-weight-hanging" },
+  strength: { label: "Stronger set", cls: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300", icon: "fa-bolt" },
+  reps: { label: "Most reps", cls: "border-sky-400/30 bg-sky-400/10 text-sky-300", icon: "fa-repeat" },
+};
+
+function prKindBadge(kind) {
+  const k = PR_KINDS[kind] || PR_KINDS.strength;
+  return `<span class="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${k.cls}"><i class="fa-solid ${k.icon}"></i>${k.label}</span>`;
+}
+
+// What a PR beat, in words: "+90 lb · was 540 lb × 10 (Mar 6)".
+function prGainText(pr) {
+  const was = `was ${prSetText(pr.previous)} (${prShortDate(pr.previous.date)})`;
+  if (pr.kind === "heaviest") return `+${prNum(pr.gain)} ${pr.set.unit} · ${was}`;
+  if (pr.kind === "reps") return `+${pr.gain} rep${pr.gain === 1 ? "" : "s"} · ${was}`;
+  return `Est. 1-rep max ${Math.round(pr.estimatedMax)} ${pr.set.unit} (+${Math.round(pr.gain)}) · best before: ${prSetText(pr.previous)}`;
+}
+
+function prStatusChip(ex) {
+  const chip = (cls, text) => `<span class="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-semibold ${cls}">${text}</span>`;
+  if (ex.status === "new") return chip("border-emerald-400/30 bg-emerald-400/10 text-emerald-300", `<i class="fa-solid fa-arrow-trend-up mr-1.5"></i>PR ${prDaysAgo(ex.lastPr.date)}`);
+  if (ex.status === "stalled") return chip("border-amber-400/30 bg-amber-400/10 text-amber-300", `No PR in ${ex.sessionsSincePr} sessions`);
+  if (ex.status === "resting") return chip("border-zinc-700 bg-zinc-800/60 text-zinc-400", `Not done since ${prShortDate(ex.lastDate)}`);
+  if (ex.status === "baseline") return chip("border-zinc-700 bg-zinc-800/60 text-zinc-400", `Done once · ${prShortDate(ex.lastDate)}`);
+  return chip("border-zinc-700 bg-zinc-800/60 text-zinc-300", ex.lastPr ? `Last PR ${prShortDate(ex.lastPr.date)}` : "No PR yet");
+}
+
+function prSparkline(values, color, width = 72, height = 22) {
+  if (!values || values.length < 2) return `<span class="inline-block" style="width:${width}px"></span>`;
+  const lo = Math.min(...values);
+  const hi = Math.max(...values);
+  const x = (i) => 2 + (i / (values.length - 1)) * (width - 4);
+  const y = (v) => height - 2 - ((v - lo) / Math.max(1e-9, hi - lo)) * (height - 4);
+  const points = values.map((v, i) => `${x(i).toFixed(1)},${(hi === lo ? height / 2 : y(v)).toFixed(1)}`).join(" ");
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true" class="shrink-0"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+function renderPrsPage() {
+  if (!prPage || !els.prsList) return;
+  const { summary, feed, exercises } = prPage.data;
+  if (!exercises.length) {
+    els.prsList.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm leading-relaxed text-zinc-500">No records yet. Finish a workout with at least one set that has reps, and your bests show up here.</div>`;
+    return;
+  }
+  const trend = summary.prsLast30 - summary.prsPrevious30;
+  const trendText = trend > 0 ? `<span class="text-emerald-400"><i class="fa-solid fa-arrow-up mr-1"></i>${trend} more</span> than the 30 days before` : trend < 0 ? `<span class="text-amber-300"><i class="fa-solid fa-arrow-down mr-1"></i>${-trend} fewer</span> than the 30 days before` : "same as the 30 days before";
+  const tile = (label, value, sub, attrs = "") => `<div ${attrs} class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 ${attrs ? "cursor-pointer transition hover:border-zinc-600" : ""}"><div class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">${label}</div><div class="mt-1 text-2xl font-black text-white">${value}</div><div class="mt-1 text-xs leading-snug text-zinc-400">${sub}</div></div>`;
+  const jump = summary.biggestJump;
+  const tiles = [
+    tile("PRs · last 30 days", summary.prsLast30, trendText),
+    tile("Exercises improving", `${summary.improvedLast30}<span class="text-base font-semibold text-zinc-500"> of ${summary.trainedLast30}</span>`, "you trained in the last 30 days set a PR"),
+    tile("Stalled", summary.stalled, summary.stalled ? "no PR in 5+ sessions. Tap to see them" : "every exercise you train is moving", summary.stalled ? `data-pr-show-stalled role="button" tabindex="0"` : ""),
+    jump
+      ? tile("Biggest jump · 30 days", `+${jump.pct}%`, `${escapeHtml(jump.name)}: est. 1-rep max ${Math.round(jump.from)} → ${Math.round(jump.to)}`, `data-pr-ex="${escapeHtml(jump.exerciseId)}" role="button" tabindex="0"`)
+      : tile("Latest PR", summary.lastPr ? prShortDate(summary.lastPr.date) : "—", summary.lastPr ? escapeHtml(summary.lastPr.name) : "none yet"),
+  ].join("");
+
+  els.prsList.innerHTML = `
+    <section class="grid grid-cols-2 gap-3 lg:grid-cols-4">${tiles}</section>
+    <section class="mt-8">
+      <div class="mb-3 flex items-baseline justify-between gap-3"><h2 class="text-lg font-bold text-zinc-100">Recent PRs</h2><span class="text-xs text-zinc-500">${feed.length} PRs since ${prShortDate(exercises.reduce((a, e) => (e.firstDate < a ? e.firstDate : a), exercises[0].firstDate))}</span></div>
+      <div id="prRecent"></div>
+    </section>
+    <section id="prAllExercises" class="mt-8 scroll-mt-20">
+      <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-lg font-bold text-zinc-100">All exercises</h2>
+        <div class="flex w-full gap-2 sm:w-auto">
+          <input id="prSearch" type="search" placeholder="Find an exercise" value="${escapeHtml(prPage.search)}" class="min-w-0 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none sm:w-56" />
+          <select id="prSort" aria-label="Sort exercises" class="rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 focus:border-emerald-500 focus:outline-none">
+            <option value="group">By muscle</option><option value="recent">Latest PR</option><option value="stalled">Stalled first</option><option value="trained">Most trained</option><option value="name">A–Z</option>
+          </select>
+        </div>
+      </div>
+      <div id="prGroupChips" class="mb-4 flex flex-wrap gap-2"></div>
+      <div id="prExerciseList"></div>
+    </section>`;
+  document.getElementById("prSort").value = prPage.sort;
+  renderPrRecent();
+  renderPrExerciseList();
+}
+
+function renderPrRecent() {
+  const box = document.getElementById("prRecent");
+  if (!box) return;
+  const { feed } = prPage.data;
+  if (!feed.length) {
+    box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">No PRs yet. Your first session of each exercise is the starting point; beat it next time.</div>`;
+    return;
+  }
+  const shown = feed.slice(0, prPage.recentShown);
+  const cards = shown.map((pr) => `
+    <button type="button" data-pr-ex="${escapeHtml(pr.exerciseId)}" class="w-[78%] min-w-0 shrink-0 snap-start rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 text-left transition hover:border-zinc-600 sm:w-auto">
+      <div class="flex items-center justify-between gap-2">${prKindBadge(pr.kind)}<span class="text-xs text-zinc-500">${prShortDate(pr.date)}</span></div>
+      <div class="mt-2 truncate font-semibold text-zinc-100">${escapeHtml(pr.name)}</div>
+      <div class="mt-0.5 text-2xl font-black tracking-tight text-white">${Number(pr.set.weight) > 0 ? `${prNum(pr.set.weight)}<span class="ml-1 text-sm font-semibold text-zinc-400">${pr.set.unit} × ${pr.set.reps}</span>` : `${pr.set.reps}<span class="ml-1 text-sm font-semibold text-zinc-400">reps</span>`}</div>
+      <div class="mt-1 text-xs leading-snug text-zinc-400">${escapeHtml(prGainText(pr))}</div>
+    </button>`).join("");
+  const more = feed.length > shown.length
+    ? `<button type="button" data-pr-more class="mt-3 w-full rounded-xl border border-zinc-800 py-2.5 text-sm font-semibold text-zinc-300 transition hover:border-zinc-600 hover:text-white">Show older PRs (${feed.length - shown.length} more)</button>`
+    : "";
+  box.innerHTML = `<div class="-mx-4 flex snap-x snap-mandatory scroll-px-4 gap-3 overflow-x-auto px-4 pb-1 sm:mx-0 sm:grid sm:snap-none sm:grid-cols-2 sm:overflow-visible sm:px-0 sm:pb-0 lg:grid-cols-3">${cards}</div>${more}`;
+}
+
+function prVisibleExercises() {
+  const search = prPage.search.trim().toLowerCase();
+  return prPage.data.exercises.filter((ex) =>
+    (search ? ex.name.toLowerCase().includes(search) : prPage.showOneOffs || ex.sessionCount > 1) &&
+    (prPage.group === "All" || ex.group === prPage.group));
+}
+
+function prSortExercises(list) {
+  const byTrained = (a, b) => b.sessionCount - a.sessionCount || a.name.localeCompare(b.name);
+  const sorted = [...list];
+  if (prPage.sort === "name") return sorted.sort((a, b) => a.name.localeCompare(b.name));
+  if (prPage.sort === "recent") return sorted.sort((a, b) => (b.lastPr?.date || "").localeCompare(a.lastPr?.date || "") || byTrained(a, b));
+  if (prPage.sort === "stalled") {
+    const rank = (ex) => (ex.status === "stalled" ? 0 : ex.status === "steady" ? 1 : ex.status === "new" ? 2 : 3);
+    return sorted.sort((a, b) => rank(a) - rank(b) || b.sessionsSincePr - a.sessionsSincePr || byTrained(a, b));
+  }
+  return sorted.sort(byTrained);
+}
+
+function prExerciseRow(ex) {
+  const color = ex.status === "new" ? "#34d399" : ex.status === "stalled" ? "#fbbf24" : "#71717a";
+  const metric = (label, value, sub = "") => `<div class="min-w-0 sm:w-32"><div class="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">${label}</div><div class="truncate text-base font-bold text-zinc-100">${value}${sub ? `<span class="ml-1 text-xs font-medium text-zinc-400">${sub}</span>` : ""}</div></div>`;
+  const metrics = ex.bodyweight
+    ? metric("Most reps", ex.mostReps.reps, "reps") + (ex.heaviest ? metric("Most added", prNum(ex.heaviest.weight), `${ex.heaviest.unit} × ${ex.heaviest.reps}`) : metric("Load", "Bodyweight"))
+    : metric("Heaviest", prNum(ex.heaviest?.weight), `${ex.heaviest?.unit || ""} × ${ex.heaviest?.reps || 0}`) + metric("Est. 1-rep max", Math.round(ex.best?.estimatedMax || 0), ex.best?.unit || "");
+  return `
+    <button type="button" data-pr-ex="${escapeHtml(ex.id)}" class="flex w-full flex-col gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-left transition hover:border-zinc-600 sm:flex-row sm:items-center">
+      <div class="flex min-w-0 flex-1 items-start justify-between gap-3">
+        <div class="min-w-0"><div class="font-semibold leading-snug text-zinc-100 sm:truncate">${escapeHtml(ex.name)}</div><div class="text-xs text-zinc-500">${ex.sessionCount} session${ex.sessionCount === 1 ? "" : "s"} · last ${prShortDate(ex.lastDate)}</div></div>
+        <div class="sm:hidden">${prStatusChip(ex)}</div>
+      </div>
+      <div class="grid grid-cols-[1fr_1fr_auto] items-center gap-3 sm:flex sm:gap-4">${metrics}${prSparkline(ex.trend, color)}</div>
+      <div class="hidden w-40 justify-end sm:flex">${prStatusChip(ex)}</div>
+    </button>`;
+}
+
+function renderPrExerciseList() {
+  const listBox = document.getElementById("prExerciseList");
+  const chipBox = document.getElementById("prGroupChips");
+  if (!listBox || !chipBox) return;
+  const counted = prPage.data.exercises.filter((ex) => prPage.showOneOffs || prPage.search.trim() || ex.sessionCount > 1);
+  const groups = PR_GROUPS.filter((g) => counted.some((ex) => ex.group === g));
+  chipBox.innerHTML = ["All", ...groups].map((g) => {
+    const n = g === "All" ? counted.length : counted.filter((ex) => ex.group === g).length;
+    const active = prPage.group === g;
+    return `<button type="button" data-pr-group="${g}" aria-pressed="${active}" class="rounded-full border px-3 py-1.5 text-xs font-semibold transition ${active ? "border-emerald-500 bg-emerald-500/15 text-emerald-300" : "border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200"}">${g} <span class="${active ? "text-emerald-400/70" : "text-zinc-600"}">${n}</span></button>`;
+  }).join("");
+
+  const visible = prSortExercises(prVisibleExercises());
+  let html = "";
+  if (!visible.length) {
+    html = `<div class="rounded-xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">No exercises match.</div>`;
+  } else if (prPage.sort === "group" && prPage.group === "All") {
+    for (const g of PR_GROUPS) {
+      const rows = visible.filter((ex) => ex.group === g);
+      if (!rows.length) continue;
+      html += `<h3 class="mb-2 mt-5 text-xs font-bold uppercase tracking-wider text-zinc-500 first:mt-0">${g} <span class="text-zinc-700">· ${rows.length}</span></h3><div class="space-y-2">${rows.map(prExerciseRow).join("")}</div>`;
+    }
+  } else {
+    html = `<div class="space-y-2">${visible.map(prExerciseRow).join("")}</div>`;
+  }
+  const oneOffs = prPage.data.exercises.filter((ex) => ex.sessionCount === 1 && (prPage.group === "All" || ex.group === prPage.group)).length;
+  if (!prPage.search.trim() && oneOffs) {
+    html += `<button type="button" data-pr-oneoffs class="mt-4 w-full rounded-xl border border-zinc-800 py-2.5 text-sm font-semibold text-zinc-400 transition hover:border-zinc-600 hover:text-white">${prPage.showOneOffs ? `Hide the ${oneOffs} exercises done only once` : `Show ${oneOffs} exercises done only once`}</button>`;
+  }
+  listBox.innerHTML = html;
+}
+
+// The detail chart: one point per session (estimated 1-rep max, or reps for bodyweight), PR sessions in gold.
+function prChartSvg(ex, width) {
+  const sessions = ex.sessions;
+  if (sessions.length < 2) return "";
+  const height = 170;
+  const padL = 34;
+  const padR = 8;
+  const padT = 10;
+  const padB = 22;
+  const span = Math.max(1, daysBetweenKeys(sessions[0].date, sessions[sessions.length - 1].date));
+  const scores = sessions.map((s) => s.score);
+  const lo = Math.floor(Math.min(...scores) * 0.95);
+  const hi = Math.ceil(Math.max(...scores) * 1.03);
+  const x = (s) => padL + (daysBetweenKeys(sessions[0].date, s.date) / span) * (width - padL - padR);
+  const y = (v) => padT + (1 - (v - lo) / Math.max(1, hi - lo)) * (height - padT - padB);
+  const best = Math.max(...scores);
+  const line = sessions.map((s) => `${x(s).toFixed(1)},${y(s.score).toFixed(1)}`).join(" ");
+  const dots = sessions.map((s) => s.pr
+    ? `<circle cx="${x(s).toFixed(1)}" cy="${y(s.score).toFixed(1)}" r="4" fill="#fbbf24" stroke="#111" stroke-width="1.5"><title>${prShortDate(s.date)}: PR</title></circle>`
+    : `<circle cx="${x(s).toFixed(1)}" cy="${y(s.score).toFixed(1)}" r="2" fill="#34d399"/>`).join("");
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${ex.bodyweight ? "Most reps" : "Estimated 1-rep max"} per session" style="display:block">
+    <line x1="${padL}" x2="${width - padR}" y1="${y(best)}" y2="${y(best)}" stroke="#fbbf24" stroke-opacity="0.35" stroke-dasharray="3 3"/>
+    <text x="0" y="${y(hi) + 8}" fill="#a1a1aa" font-size="10">${hi}</text>
+    <text x="0" y="${y(lo)}" fill="#a1a1aa" font-size="10">${lo}</text>
+    <text x="${padL}" y="${height - 4}" fill="#71717a" font-size="10">${prShortDate(sessions[0].date)}</text>
+    <text x="${width - padR}" y="${height - 4}" fill="#71717a" font-size="10" text-anchor="end">${prShortDate(sessions[sessions.length - 1].date)}</text>
+    <polyline points="${line}" fill="none" stroke="#34d399" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>${dots}</svg>`;
+}
+
+function openPrDetail(exerciseId) {
+  const ex = prPage?.data.exercises.find((e) => e.id === exerciseId);
+  const dialog = document.getElementById("prDetailDialog");
+  const content = document.getElementById("prDetailContent");
+  if (!ex || !dialog || !content) return;
+  const stat = (label, value, sub) => `<div class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3"><div class="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">${label}</div><div class="mt-0.5 text-lg font-black text-white">${value}</div><div class="text-xs text-zinc-500">${sub}</div></div>`;
+  const stats = ex.bodyweight
+    ? stat("Most reps", `${ex.mostReps.reps} reps`, prShortDate(ex.mostReps.date)) +
+      (ex.heaviest ? stat("Most added weight", prSetText(ex.heaviest), prShortDate(ex.heaviest.date)) : stat("Sessions", ex.sessionCount, `since ${prShortDate(ex.firstDate)}`))
+    : stat("Heaviest", prSetText(ex.heaviest), prShortDate(ex.heaviest.date)) +
+      stat("Est. 1-rep max", `${Math.round(ex.best.estimatedMax)} ${ex.best.unit}`, `from ${prSetText(ex.best)} · ${prShortDate(ex.best.date)}`);
+  const recordRows = ex.recordSets.map((s) => `<div class="flex items-center justify-between gap-3 border-t border-zinc-800 py-2 text-sm first:border-t-0"><span class="font-semibold text-zinc-100">${prSetText(s)}</span><span class="text-xs text-zinc-500">${prShortDate(s.date)}</span></div>`).join("");
+  const history = [...ex.prs].reverse().map((pr) => `<div class="border-t border-zinc-800 py-2.5 first:border-t-0"><div class="flex flex-wrap items-center justify-between gap-2"><span class="flex items-center gap-2">${prKindBadge(pr.kind)}<span class="font-semibold text-zinc-100">${prSetText(pr.set)}</span></span><span class="text-xs text-zinc-500">${prShortDate(pr.date)}</span></div><div class="mt-1 text-xs text-zinc-400">${escapeHtml(prGainText(pr))}</div></div>`).join("");
+  const recent = [...ex.sessions].reverse().slice(0, 5).map((s) => `<div class="border-t border-zinc-800 py-2 first:border-t-0"><div class="flex items-center justify-between text-xs"><span class="font-semibold text-zinc-300">${prShortDate(s.date)}</span>${s.pr ? prKindBadge(s.pr) : ""}</div><div class="mt-1 text-xs text-zinc-500">${s.sets.map(prSetText).join(" · ")}</div></div>`).join("");
+  content.innerHTML = `
+    <div class="mb-4 flex items-start justify-between gap-3">
+      <div class="min-w-0"><h3 class="text-xl font-bold text-white">${escapeHtml(ex.name)}</h3><div class="mt-0.5 text-xs text-zinc-500">${ex.group} · ${ex.sessionCount} session${ex.sessionCount === 1 ? "" : "s"} since ${prShortDate(ex.firstDate)} · ${ex.prs.length} PR${ex.prs.length === 1 ? "" : "s"}</div></div>
+      <button type="button" data-pr-close class="-mr-1 rounded-lg p-2 text-zinc-500 outline-none transition hover:bg-zinc-800 hover:text-white focus-visible:ring-2 focus-visible:ring-zinc-500" aria-label="Close"><i class="fa-solid fa-xmark text-lg"></i></button>
+    </div>
+    <div class="mb-4">${prStatusChip(ex)}</div>
+    <div class="grid grid-cols-2 gap-3">${stats}</div>
+    ${ex.sessions.length > 1 ? `<div class="mt-5"><div class="mb-2 text-xs font-bold uppercase tracking-wider text-zinc-500">${ex.bodyweight ? "Most reps" : "Estimated 1-rep max"} per session <span class="font-normal normal-case tracking-normal text-zinc-600">· gold = PR</span></div><div id="prDetailChart"></div></div>` : ""}
+    ${recordRows ? `<div class="mt-5"><div class="text-xs font-bold uppercase tracking-wider text-zinc-500">Unbeaten sets</div><div class="mb-1 text-xs text-zinc-600">No other set had as much weight and as many reps. Beat one of these to set a PR.</div>${recordRows}</div>` : ""}
+    <div class="mt-5"><div class="mb-1 text-xs font-bold uppercase tracking-wider text-zinc-500">PR history</div>${history || `<div class="py-2 text-sm text-zinc-500">No PRs yet. ${ex.sessionCount === 1 ? "Your first session is the starting point." : "Beat your best set to get one."}</div>`}</div>
+    <div class="mt-5"><div class="mb-1 text-xs font-bold uppercase tracking-wider text-zinc-500">Recent sessions</div>${recent}</div>
+    <p class="mt-5 text-xs leading-relaxed text-zinc-600">A wrong number here comes from a logged set: edit that workout and this page follows.</p>`;
+  if (!dialog.open) dialog.showModal();
+  content.scrollTop = 0;
+  // Drawn once the dialog is open, so it can be as wide as the dialog really is.
+  const chart = document.getElementById("prDetailChart");
+  if (chart) chart.innerHTML = prChartSvg(ex, Math.max(240, Math.min(640, chart.clientWidth || 300)));
+}
+
+els.prsList?.addEventListener("click", (event) => {
+  if (!prPage) return;
+  const target = event.target.closest("[data-pr-ex],[data-pr-group],[data-pr-more],[data-pr-oneoffs],[data-pr-show-stalled]");
+  if (!target) return;
+  if (target.hasAttribute("data-pr-ex")) return openPrDetail(target.getAttribute("data-pr-ex"));
+  if (target.hasAttribute("data-pr-group")) {
+    prPage.group = target.getAttribute("data-pr-group");
+    return renderPrExerciseList();
+  }
+  if (target.hasAttribute("data-pr-more")) {
+    prPage.recentShown += 9;
+    return renderPrRecent();
+  }
+  if (target.hasAttribute("data-pr-oneoffs")) {
+    prPage.showOneOffs = !prPage.showOneOffs;
+    return renderPrExerciseList();
+  }
+  if (target.hasAttribute("data-pr-show-stalled")) {
+    prPage.sort = "stalled";
+    prPage.group = "All";
+    const sort = document.getElementById("prSort");
+    if (sort) sort.value = "stalled";
+    renderPrExerciseList();
+    document.getElementById("prAllExercises")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+});
+els.prsList?.addEventListener("keydown", (event) => {
+  if ((event.key === "Enter" || event.key === " ") && event.target.matches("[role=button]")) {
+    event.preventDefault();
+    event.target.click();
+  }
+});
+els.prsList?.addEventListener("input", (event) => {
+  if (!prPage || event.target.id !== "prSearch") return;
+  prPage.search = event.target.value;
+  renderPrExerciseList();
+});
+els.prsList?.addEventListener("change", (event) => {
+  if (!prPage || event.target.id !== "prSort") return;
+  prPage.sort = event.target.value;
+  renderPrExerciseList();
+});
+document.getElementById("prDetailDialog")?.addEventListener("click", (event) => {
+  const dialog = event.currentTarget;
+  if (event.target === dialog || event.target.closest("[data-pr-close]")) dialog.close();
+});
 
 let analyticsWindowWorkouts = [];
 let chartWorkoutsSample = [];

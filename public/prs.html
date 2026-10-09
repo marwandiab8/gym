@@ -19,6 +19,7 @@
   <link rel="modulepreload" href="app.js?v=20260514-theme1" />
   <link rel="modulepreload" href="js/setScoring.js" />
   <link rel="modulepreload" href="js/workoutSession.js" />
+  <link rel="modulepreload" href="js/prRecords.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js" />
@@ -121,14 +122,19 @@
     </nav>
   </div>
 
-  <main class="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-    <div class="lg:col-span-12">
-      <div class="bg-[#111] border border-zinc-800 rounded-3xl p-6 md:p-8">
-        <h2 class="text-2xl font-bold mb-6 flex items-center gap-3"><i class="fa-solid fa-trophy text-yellow-500"></i> Personal Records</h2>
-        <div id="prsList" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
-      </div>
+  <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+    <div class="mb-6">
+      <h1 class="flex items-center gap-3 text-2xl font-bold"><i class="fa-solid fa-trophy text-yellow-500"></i> Personal Records</h1>
+      <p class="mt-2 max-w-3xl text-sm leading-relaxed text-zinc-400">Worked out from every finished workout. A <b class="text-zinc-200">PR</b> is a heavier weight than you've ever lifted on that exercise, or a stronger set: enough extra weight or reps to raise your estimated 1-rep max. The first time you do an exercise is your starting point. Tap any exercise for its history.</p>
+    </div>
+    <div id="prsList" aria-live="polite">
+      <div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Loading your records…</div>
     </div>
   </main>
+
+  <dialog id="prDetailDialog" class="m-auto w-[calc(100%-1.5rem)] max-w-2xl rounded-3xl border border-zinc-700 bg-[#111] p-0 text-zinc-100 shadow-2xl backdrop:bg-black/80">
+    <div id="prDetailContent" class="max-h-[85vh] overflow-y-auto p-5 sm:p-6"></div>
+  </dialog>
 
   <div id="restTimerWidget" class="hidden fixed bottom-6 right-6 bg-zinc-900 border border-zinc-700 rounded-2xl p-4 shadow-[0_10px_40px_rgba(0,0,0,0.5)] z-50 flex items-center gap-5">
     <div class="text-emerald-400 font-mono text-3xl font-black tracking-widest" id="timerDisplay">02:00</div>
