@@ -22,6 +22,10 @@ const {
   timestampToMs,
 } = require("./lib/workoutDateRepair");
 
+const crypto = require("crypto");
+const { Timestamp } = require("firebase-admin/firestore");
+const { bucketByMinute, daysBetween, heartRateSamples, summarizeWorkout } = require("./lib/heartRate");
+
 admin.initializeApp();
 
 // Gen1 callable + Secret Manager (same name as before). Do not use v2 onCall here:
@@ -485,6 +489,15 @@ exports.onWorkoutFinalize = functions.firestore
 
     if (afterIsFinal || beforeWasFinal) {
       await syncWorkoutSummary(uid, workoutId, after);
+    }
+
+    // Heart rate already sent from Apple Health for this workout's time (it can arrive before or after).
+    if (afterIsFinal) {
+      try {
+        await syncWorkoutHeartRate(uid, [{ id: workoutId, ...after }]);
+      } catch (error) {
+        console.error("Heart-rate sync failed", { uid, workoutId, message: error?.message || String(error) });
+      }
     }
 
     const affectedExerciseIds = [...new Set([
@@ -1049,3 +1062,101 @@ exports.generateAiRoutine = functions
   });
 
 Object.assign(exports, require("./timeLeftGym/triggers"));
+
+// ---------------------------------------------------------------- heart rate from Apple Health
+// The Health Auto Export app posts its JSON to healthHeartRate with the user's own token (made on the
+// Settings page). Readings are filed by minute (users/{uid}/heartRateDays/{day}); each finished workout they
+// cover gets a summary in users/{uid}/workoutHeartRate/{workoutId}, which the app shows beside the workout.
+// See lib/heartRate.js.
+
+const HEALTH_TOKENS = "healthTokens"; // {sha256(token)} -> { uid }: server only
+const hashToken = (token) => crypto.createHash("sha256").update(String(token)).digest("hex");
+
+/** Recomputes the heart-rate summary of each given workout from the minute readings of its days. */
+async function syncWorkoutHeartRate(uid, workouts) {
+  const db = admin.firestore();
+  const dayCache = new Map();
+  const dayMinutes = async (day) => {
+    if (!dayCache.has(day)) {
+      const snap = await db.doc(`users/${uid}/heartRateDays/${day}`).get();
+      dayCache.set(day, snap.exists ? snap.get("m") || {} : {});
+    }
+    return dayCache.get(day);
+  };
+  let written = 0;
+  for (const w of workouts) {
+    const startMs = timestampToMs(w.startedAt);
+    const endMs = timestampToMs(w.finishedAt);
+    if (!w.id || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
+    // A workout left open for days (forgotten Finish) isn't a heart-rate record.
+    if (endMs - startMs > 6 * 60 * 60 * 1000) continue;
+    const days = daysBetween(startMs, endMs);
+    const minutes = {};
+    for (const day of days) minutes[day] = await dayMinutes(day);
+    const summary = summarizeWorkout(minutes, startMs, endMs);
+    const ref = db.doc(`users/${uid}/workoutHeartRate/${w.id}`);
+    if (summary) {
+      await ref.set({ ...summary, startedAtMs: startMs, finishedAtMs: endMs, source: "Apple Health", updatedAtMs: Date.now() });
+      written += 1;
+    }
+  }
+  return written;
+}
+
+// Settings -> Apple Health heart rate: a new token for the Health Auto Export automation (shown once).
+exports.createHealthToken = functions.region("us-central1").https.onCall(async (data, context) => {
+  const uid = context.auth && context.auth.uid;
+  if (!uid) throw new functions.https.HttpsError("unauthenticated", "Sign in first.");
+  const db = admin.firestore();
+  const token = crypto.randomBytes(24).toString("base64url");
+  const hash = hashToken(token);
+  const privateRef = db.doc(`users/${uid}/private/health`);
+  const previous = await privateRef.get();
+  const batch = db.batch();
+  if (previous.exists && previous.get("tokenHash")) batch.delete(db.collection(HEALTH_TOKENS).doc(previous.get("tokenHash")));
+  batch.set(db.collection(HEALTH_TOKENS).doc(hash), { uid, createdAtMs: Date.now() });
+  batch.set(privateRef, { tokenHash: hash, tokenCreatedAtMs: Date.now() }, { merge: true });
+  await batch.commit();
+  return { token, url: "https://us-central1-gym-k2.cloudfunctions.net/healthHeartRate" };
+});
+
+// Health Auto Export -> heart-rate readings. Answers 200 with what it filed; never echoes the body back.
+exports.healthHeartRate = functions
+  .runWith({ timeoutSeconds: 120, memory: "512MB" })
+  .region("us-central1")
+  .https.onRequest(async (req, res) => {
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Use POST." });
+    const auth = String(req.get("authorization") || "");
+    const token = (auth.match(/^Bearer\s+(.+)$/i) || [])[1] || String(req.query.token || "");
+    if (!token.trim()) return res.status(401).json({ ok: false, error: "Missing token." });
+    const db = admin.firestore();
+    const owner = await db.collection(HEALTH_TOKENS).doc(hashToken(token.trim())).get();
+    if (!owner.exists) return res.status(401).json({ ok: false, error: "Unknown token - make a new one on the gym app's Settings page." });
+    const uid = owner.get("uid");
+    try {
+      const samples = heartRateSamples(req.body);
+      const byDay = bucketByMinute(samples);
+      const days = Object.keys(byDay).sort();
+      for (const day of days) {
+        await db.doc(`users/${uid}/heartRateDays/${day}`).set({ m: byDay[day], updatedAtMs: Date.now() }, { merge: true });
+      }
+      let workoutsUpdated = 0;
+      if (samples.length) {
+        const first = Math.min(...samples.map((x) => x.ms));
+        const last = Math.max(...samples.map((x) => x.ms));
+        const snap = await db
+          .collection(`users/${uid}/workouts`)
+          .where("startedAt", ">=", Timestamp.fromMillis(first - 6 * 60 * 60 * 1000))
+          .where("startedAt", "<=", Timestamp.fromMillis(last))
+          .get();
+        const finished = snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((w) => w.status === "final");
+        workoutsUpdated = await syncWorkoutHeartRate(uid, finished);
+      }
+      await db.doc(`users/${uid}/private/health`).set({ lastReceivedAtMs: Date.now(), lastReadings: samples.length, lastDays: days }, { merge: true });
+      console.log("healthHeartRate", { uid, readings: samples.length, days: days.length, workoutsUpdated });
+      return res.status(200).json({ ok: true, readings: samples.length, days: days.length, workoutsUpdated });
+    } catch (error) {
+      console.error("healthHeartRate failed", { uid, message: error?.message || String(error) });
+      return res.status(500).json({ ok: false, error: "Could not file the heart-rate readings." });
+    }
+  });

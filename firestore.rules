@@ -135,6 +135,21 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      // Heart rate from Apple Health (functions: healthHeartRate). Written only by Functions; the app reads it.
+      match /workoutHeartRate/{workoutId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+      match /heartRateDays/{day} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+      // private/health: when readings last arrived (the token itself is only ever stored hashed).
+      match /private/{docId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+
       match /exercise_last_sets/{exerciseId} {
         allow read: if isOwner(userId);
         allow write: if false;

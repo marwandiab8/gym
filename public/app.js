@@ -69,6 +69,9 @@ const els = {
   removeWorkoutBtn: document.getElementById("removeWorkoutBtn"),
   editWorkoutFocusBtn: document.getElementById("editWorkoutFocusBtn"),
   themeColorInput: document.getElementById("themeColorInput"),
+  healthStatus: document.getElementById("healthStatus"),
+  healthTokenBtn: document.getElementById("healthTokenBtn"),
+  healthSetup: document.getElementById("healthSetup"),
   themeColorValue: document.getElementById("themeColorValue"),
   themePreviewSwatch: document.getElementById("themePreviewSwatch"),
   themeResetBtn: document.getElementById("themeResetBtn"),
@@ -1177,6 +1180,8 @@ onAuthStateChanged(auth, async (user) => {
     resetWorkoutState({ clearLocal: false });
     setAuthUI();
     if (els.templatesList) els.templatesList.innerHTML = `<div class="text-zinc-500 text-sm">Sign in to see routines.</div>`;
+    workoutHeartRates.clear();
+    if (els.healthStatus) els.healthStatus.textContent = "Sign in to set this up.";
     renderRecentWorkoutsSignedOut();
     handleRouteChange();
     return;
@@ -1189,6 +1194,7 @@ onAuthStateChanged(auth, async (user) => {
   runBootstrapStep("analytics", () => loadAnalytics());
   runBootstrapStep("templates", () => loadTemplates());
   runBootstrapStep("integrity check", () => runIntegrityCheckIfDue());
+  if (els.healthStatus) runBootstrapStep("health status", () => renderHealthStatus());
   setAuthUI();
   setActiveBadge();
   renderWorkoutBuilder();
@@ -2620,6 +2626,105 @@ function workoutFullDisplayDate(workout) {
   return timeString ? `${displayDate} at ${timeString}` : displayDate;
 }
 
+// ---- Settings -> Heart rate from Apple Health: when readings last arrived, and a code for Health Auto Export.
+async function renderHealthStatus() {
+  if (!els.healthStatus || !currentUser) return;
+  const snap = await getDoc(doc(db, "users", currentUser.uid, "private", "health"));
+  const d = snap.exists() ? snap.data() : {};
+  if (els.healthTokenBtn) els.healthTokenBtn.textContent = d.tokenHash ? "Make a new code" : "Set up heart rate";
+  if (!d.tokenHash) {
+    els.healthStatus.textContent = "Not set up yet. Tap Set up heart rate, then add the automation below in Health Auto Export.";
+  } else if (!d.lastReceivedAtMs) {
+    els.healthStatus.textContent = "Set up - waiting for the first readings from Health Auto Export (run Manual export once).";
+  } else {
+    const when = new Date(d.lastReceivedAtMs).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    els.healthStatus.innerHTML = `<i class="fa-solid fa-circle-check mr-2 text-emerald-400"></i>Readings last arrived ${escapeHtml(when)} (${Number(d.lastReadings) || 0} readings). Heart rate shows beside each workout it covers.`;
+  }
+}
+
+if (els.healthTokenBtn) {
+  els.healthTokenBtn.addEventListener("click", async () => {
+    if (!currentUser) return setStatus("Sign in first.", "error");
+    if (els.healthTokenBtn.textContent === "Make a new code" && !confirm("Make a new code? The automation in Health Auto Export will need the new one.")) return;
+    els.healthTokenBtn.disabled = true;
+    try {
+      const { data } = await httpsCallable(functions, "createHealthToken")();
+      document.getElementById("healthUrl").textContent = data.url;
+      document.getElementById("healthHeader").textContent = `Bearer ${data.token}`;
+      els.healthSetup?.classList.remove("hidden");
+      await renderHealthStatus();
+    } catch (e) {
+      console.error("createHealthToken failed", e);
+      setStatus("Could not make a code. Try again.", "error");
+    } finally {
+      els.healthTokenBtn.disabled = false;
+    }
+  });
+  document.querySelectorAll(".health-copy").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const text = document.getElementById(btn.dataset.copy)?.textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "Copied";
+        setTimeout(() => (btn.textContent = "Copy"), 1500);
+      } catch {
+        setStatus("Couldn't copy - press and hold the text to copy it.", "info");
+      }
+    }),
+  );
+}
+
+// ---- Heart rate from Apple Health (functions: healthHeartRate -> users/{uid}/workoutHeartRate/{workoutId}).
+const workoutHeartRates = new Map(); // workoutId -> { avg, max, min, minutes, series } | null (none)
+
+async function loadHeartRates(workouts) {
+  if (!currentUser) return false;
+  const missing = (workouts || []).filter((w) => w?.id && !workoutHeartRates.has(w.id));
+  if (!missing.length) return false;
+  await Promise.all(missing.map(async (w) => {
+    try {
+      const snap = await getDoc(doc(db, "users", currentUser.uid, "workoutHeartRate", w.id));
+      workoutHeartRates.set(w.id, snap.exists() ? snap.data() : null);
+    } catch {
+      workoutHeartRates.set(w.id, null);
+    }
+  }));
+  return true;
+}
+
+// The session's heart rate as an SVG line: small beside a list row, full width in the workout details.
+function heartRateSvg(hr, { width = 72, height = 22, axes = false } = {}) {
+  const series = Array.isArray(hr?.series) ? hr.series : [];
+  if (series.length < 2) return "";
+  const pad = axes ? 26 : 2;
+  const lastX = Math.max(1, series[series.length - 1].m);
+  const lo = Math.min(hr.min ?? Infinity, ...series.map((p) => p.b)) - 5;
+  const hi = Math.max(hr.max ?? -Infinity, ...series.map((p) => p.b)) + 5;
+  const x = (m) => pad + (m / lastX) * (width - pad - 2);
+  const y = (b) => height - (axes ? 16 : 2) - ((b - lo) / Math.max(1, hi - lo)) * (height - (axes ? 22 : 4));
+  const points = series.map((p) => `${x(p.m).toFixed(1)},${y(p.b).toFixed(1)}`).join(" ");
+  const labels = axes
+    ? `<text x="0" y="${y(hi - 5) + 4}" fill="#a1a1aa" font-size="10">${hi - 5}</text><text x="0" y="${y(lo + 5) + 4}" fill="#a1a1aa" font-size="10">${lo + 5}</text><text x="${pad}" y="${height - 2}" fill="#71717a" font-size="10">0 min</text><text x="${width - 2}" y="${height - 2}" fill="#71717a" font-size="10" text-anchor="end">${lastX} min</text><line x1="${pad}" x2="${width - 2}" y1="${y(hr.avg)}" y2="${y(hr.avg)}" stroke="#fb7185" stroke-opacity="0.35" stroke-dasharray="3 3"/>`
+    : "";
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true" style="display:block">${labels}<polyline points="${points}" fill="none" stroke="#fb7185" stroke-width="${axes ? 2 : 1.5}" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+// Workout details: the session's heart rate - numbers and the graph - when Apple Health has it.
+async function fillModalHeartRate(workout) {
+  const box = document.getElementById("modalHeartRate");
+  if (!box || !workout?.id) return;
+  await loadHeartRates([workout]);
+  const hr = workoutHeartRates.get(workout.id);
+  if (!hr || currentModalWorkoutId !== workout.id) return;
+  const width = Math.max(240, Math.min(560, box.clientWidth || 320));
+  box.innerHTML = `<div class="mb-6 rounded-2xl border border-rose-500/20 bg-rose-500/5 px-4 py-3"><div class="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1"><span class="text-xs font-bold uppercase tracking-wide text-rose-300"><i class="fa-solid fa-heart-pulse mr-2"></i>Heart rate</span><span class="text-sm text-zinc-200"><b class="text-white">${hr.avg}</b> avg · <b class="text-white">${hr.max}</b> max · ${hr.min} min <span class="text-zinc-500">bpm</span></span></div>${heartRateSvg(hr, { width, height: 120, axes: true })}<div class="mt-1 text-xs text-zinc-500">From Apple Health · ${hr.minutes} minutes recorded</div></div>`;
+}
+
+function heartRateBadge(hr, compact = false) {
+  if (!hr) return "";
+  return `<div class="flex items-center gap-2 text-xs text-rose-300" title="Heart rate from Apple Health: ${hr.minutes} minutes recorded"><i class="fa-solid fa-heart-pulse"></i><span>${hr.avg} avg · ${hr.max} max</span>${compact ? "" : heartRateSvg(hr)}</div>`;
+}
+
 function createWorkoutListItem(workout, options = {}) {
   const { compact = false } = options;
   const { displayDate, timeString } = workoutDisplayMeta(workout);
@@ -2631,9 +2736,9 @@ function createWorkoutListItem(workout, options = {}) {
   const exerciseCount = Number(workout.exerciseCount || (workout.exercises || []).length || (workout.exerciseSummaries || []).length || 0);
   const hasSessionNotes = typeof workout.notes === "string" && workout.notes.trim().length > 0;
   if (compact) {
-    div.innerHTML = `<div class="flex items-center justify-between gap-3"><div class="min-w-0"><div class="truncate text-sm font-semibold text-zinc-200">${escapeHtml(workout.routineName || "Custom Workout")}</div><div class="text-xs text-zinc-500">${escapeHtml(displayDate)} ${escapeHtml(timeString)}</div></div><div class="shrink-0 text-xs font-bold text-emerald-400">${exerciseCount}</div></div>`;
+    div.innerHTML = `<div class="flex items-center justify-between gap-3"><div class="min-w-0"><div class="truncate text-sm font-semibold text-zinc-200">${escapeHtml(workout.routineName || "Custom Workout")}</div><div class="text-xs text-zinc-500">${escapeHtml(displayDate)} ${escapeHtml(timeString)}</div>${heartRateBadge(workoutHeartRates.get(workout.id), true)}</div><div class="shrink-0 text-xs font-bold text-emerald-400">${exerciseCount}</div></div>`;
   } else {
-    div.innerHTML = `<div><div class="font-medium text-zinc-200">${escapeHtml(displayDate)} <span class="text-zinc-500 text-xs ml-1">${escapeHtml(timeString)}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises${hasSessionNotes ? ` <span class="ml-2 text-amber-400"><i class="fa-regular fa-note-sticky mr-1"></i>Notes</span>` : ""}</div></div><div class="text-right text-emerald-400 font-bold">${escapeHtml(workout.routineName || "Custom Workout")}</div>`;
+    div.innerHTML = `<div><div class="font-medium text-zinc-200">${escapeHtml(displayDate)} <span class="text-zinc-500 text-xs ml-1">${escapeHtml(timeString)}</span></div><div class="text-xs text-zinc-500">${exerciseCount} exercises${hasSessionNotes ? ` <span class="ml-2 text-amber-400"><i class="fa-regular fa-note-sticky mr-1"></i>Notes</span>` : ""}</div>${heartRateBadge(workoutHeartRates.get(workout.id))}</div><div class="text-right text-emerald-400 font-bold">${escapeHtml(workout.routineName || "Custom Workout")}</div>`;
   }
   div.onclick = (event) => {
     event.preventDefault();
@@ -2722,6 +2827,12 @@ async function refreshRecentWorkoutsPage(options = {}) {
       .sort((a, b) => (Number(b.updatedAtMs) || 0) - (Number(a.updatedAtMs) || 0));
     recentWorkoutsCursor = snap.docs[snap.docs.length - 1] || recentWorkoutsCursor;
     recentWorkoutsHasMore = snap.docs.length === RECENT_WORKOUTS_PAGE_SIZE;
+    // Heart rate beside each one, as soon as it's looked up.
+    loadHeartRates(rows).then((changed) => {
+      if (!changed) return;
+      renderRecentWorkoutsPage();
+      renderRecentWorkoutsPreview();
+    });
     analyticsWindowWorkouts = mergeWorkoutLikeRecords(analyticsWindowWorkouts, rows)
       .sort(compareWorkoutsByDateDesc);
     renderRecentWorkoutsPreview();
@@ -2971,7 +3082,7 @@ function showWorkoutDetailsModal(workout, displayDate) {
     if (els.removeWorkoutBtn) els.removeWorkoutBtn.disabled = !isSavedWorkout;
     const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
     const sessionNotes = typeof workout.notes === "string" ? workout.notes.trim() : "";
-    let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div>`;
+    let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div><div id="modalHeartRate"></div>`;
     if (sessionNotes) {
         contentHtml += `<div class="mb-6 rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3"><div class="mb-1 text-xs font-bold uppercase tracking-wide text-amber-300"><i class="fa-regular fa-note-sticky mr-2"></i>Session Notes</div><div class="text-sm leading-relaxed text-zinc-200 whitespace-pre-wrap">${escapeHtml(sessionNotes)}</div></div>`;
     }
@@ -3009,6 +3120,7 @@ function showWorkoutDetailsModal(workout, displayDate) {
         contentHtml += `</div>`;
     });
     els.modalContent.innerHTML = contentHtml; els.workoutModal.showModal();
+    fillModalHeartRate(workout);
 }
 els.editWorkoutNameBtn?.addEventListener("click", async () => {
     if (!currentModalWorkoutId || !currentUser) return;
