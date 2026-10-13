@@ -4276,6 +4276,10 @@ const MACHINE_UPLOADS_AT_ONCE = 3;
 let storageApiPromise = null;
 let exdbIndexPromise = null;
 let exerciseLinksPromise = null;
+// ExerciseDB lists some exercises twice, and one copy has no animation: that copy points at its twin
+// (`sameAs` in the index) so a link or workout made with it still shows the animation.
+let exdbSameAs = new Map();
+const canonicalExdbId = (id) => exdbSameAs.get(id) || id;
 
 function storageApi() {
   if (!storageApiPromise) {
@@ -4288,12 +4292,19 @@ function storageApi() {
   return storageApiPromise;
 }
 
-/** ExerciseDB's exercises for search and pickers: [{ id: "exdb_…", name, equipment, target, bodyParts }]. */
+/**
+ * ExerciseDB's exercises for search and pickers: [{ id: "exdb_…", name, equipment, target, bodyParts, noGif? }]
+ * (noGif: ExerciseDB has no animation for it). Copies that point at a twin are left out.
+ */
 function loadExdbIndex() {
   if (!exdbIndexPromise) {
     exdbIndexPromise = fetch(EXDB_INDEX_URL)
       .then((r) => (r.ok ? r.json() : []))
-      .catch(() => []);
+      .catch(() => [])
+      .then((all) => {
+        exdbSameAs = new Map(all.filter((e) => e.sameAs).map((e) => [e.id, e.sameAs]));
+        return all.filter((e) => !e.sameAs);
+      });
   }
   return exdbIndexPromise;
 }
@@ -4302,8 +4313,11 @@ function loadExdbIndex() {
 function loadExerciseLinks() {
   if (!currentUser) return Promise.resolve(new Map());
   if (!exerciseLinksPromise) {
-    exerciseLinksPromise = getDocs(collection(db, "users", currentUser.uid, "exercise_links"))
-      .then((snap) => new Map(snap.docs.map((d) => [d.id, d.data()])))
+    exerciseLinksPromise = Promise.all([getDocs(collection(db, "users", currentUser.uid, "exercise_links")), loadExdbIndex()])
+      .then(([snap]) => new Map(snap.docs.map((d) => {
+        const link = d.data();
+        return [d.id, link.exdbId ? { ...link, exdbId: canonicalExdbId(link.exdbId) } : link];
+      })))
       .catch(() => new Map());
   }
   return exerciseLinksPromise;
@@ -4344,7 +4358,7 @@ async function openExerciseCard(exerciseId, name) {
       .catch(() => []),
     loadExerciseLinks(),
   ]);
-  const exdbId = exerciseId.startsWith("exdb_") ? exerciseId : links.get(exerciseId)?.exdbId || null;
+  const exdbId = exerciseId.startsWith("exdb_") ? canonicalExdbId(exerciseId) : links.get(exerciseId)?.exdbId || null;
   const exdb = exdbId ? await getDoc(doc(db, "exercisedb", exdbId)).then((s) => (s.exists() ? s.data() : null)).catch(() => null) : null;
   const photo = photos.sort((a, b) => (b.taggedAt?.toMillis?.() || 0) - (a.taggedAt?.toMillis?.() || 0))[0];
   const parts = [];
@@ -4355,7 +4369,7 @@ async function openExerciseCard(exerciseId, name) {
     const muscles = [...(exdb.targetMuscles || []), ...(exdb.secondaryMuscles || [])].map(titleCase).join(", ");
     parts.push(`<div class="${photo ? "mt-5 border-t border-zinc-800 pt-4" : ""}">
       <div class="mb-2 text-xs font-bold uppercase tracking-wider text-zinc-500">How it's done${exdb.name && titleCase(exdb.name) !== name ? ` · ${escapeHtml(titleCase(exdb.name))}` : ""}</div>
-      ${exdb.gifUrl ? `<img src="${escapeHtml(exdb.gifUrl)}" alt="How to do ${escapeHtml(exdb.name || name)}" loading="lazy" class="mx-auto w-full max-w-[280px] rounded-xl bg-white">` : ""}
+      ${exdb.gifUrl ? `<img src="${escapeHtml(exdb.gifUrl)}" alt="How to do ${escapeHtml(exdb.name || name)}" loading="lazy" onerror="this.remove()" class="mx-auto w-full max-w-[280px] rounded-xl bg-white">` : ""}
       ${muscles ? `<div class="mt-3 text-sm text-zinc-300"><span class="text-zinc-500">Works:</span> ${escapeHtml(muscles)}</div>` : ""}
       ${(exdb.equipments || []).length ? `<div class="mt-1 text-sm text-zinc-300"><span class="text-zinc-500">Equipment:</span> ${escapeHtml(exdb.equipments.map(titleCase).join(", "))}</div>` : ""}
       ${(exdb.instructions || []).length ? `<details class="mt-3"><summary class="cursor-pointer select-none text-sm font-semibold text-emerald-400">Step by step</summary><ol class="mt-2 list-decimal space-y-1 pl-5 text-sm text-zinc-300">${exdb.instructions.map((step) => `<li>${escapeHtml(String(step).replace(/^Step:\d+\s*/, ""))}</li>`).join("")}</ol></details>` : ""}
@@ -4625,12 +4639,14 @@ async function loadExerciseLinksPage() {
       loadExdbIndex(),
     ]);
     const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    for (const row of rows) if (row.exdbId) row.exdbId = canonicalExdbId(row.exdbId);
     // Custom exercises made since the first linking, not linked yet.
     customSnap.forEach((d) => {
       if (!rows.some((r) => r.id === d.id)) rows.push({ id: d.id, name: d.data().name, exdbId: null, exdbName: null, matchedBy: "unlinked", sessions: 0 });
     });
     const opened = location.hash.match(/^#ex=(.+)$/);
-    linksPage = { rows, exdb, filter: "all", search: "", openRow: opened ? decodeURIComponent(opened[1]) : null, query: "" };
+    // saved: rows changed on this visit -> their status before, so they stay where they were (marked Saved).
+    linksPage = { rows, exdb, byId: new Map(exdb.map((e) => [e.id, e])), filter: "all", search: "", openRow: opened ? decodeURIComponent(opened[1]) : null, query: "", saved: new Map() };
     renderExerciseLinksPage();
     if (linksPage.openRow) document.querySelector(`[data-link-row="${CSS.escape(linksPage.openRow)}"]`)?.scrollIntoView({ block: "center" });
   } catch (err) {
@@ -4645,28 +4661,42 @@ function linkSuggestions(text) {
     .map((ex) => ({ ex, score: scoreExerciseAgainstQuery(expanded, ex.name, [...(ex.equipment || []), ...(ex.target || []), ...(ex.bodyParts || [])]) }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score)
-    .slice(0, 8)
-    .map((x) => x.ex);
+    .map((x) => x.ex)
+    // ExerciseDB has a few exercises twice under the same name: show each name once.
+    .filter((ex, i, list) => list.findIndex((o) => o.name.toLowerCase() === ex.name.toLowerCase()) === i)
+    .slice(0, 12);
+}
+
+/** An ExerciseDB animation thumbnail, or a box saying there is none. */
+function exdbThumb(exdbId, size, emptyText) {
+  const ex = exdbId ? linksPage.byId.get(exdbId) : null;
+  if (!exdbId || ex?.noGif) {
+    return `<div class="flex ${size} shrink-0 items-center justify-center rounded-xl border border-dashed border-zinc-700 p-1 text-center text-[11px] leading-tight text-zinc-500">${exdbId ? "No animation" : emptyText}</div>`;
+  }
+  return `<img src="${escapeHtml(exdbGifUrl(exdbId))}" alt="" loading="lazy" onerror="this.style.visibility='hidden'" class="${size} shrink-0 rounded-xl bg-white object-contain">`;
 }
 
 function linkRowHtml(row) {
   const status = LINK_STATUS[row.matchedBy] || LINK_STATUS.match;
   const open = linksPage.openRow === row.id;
-  const thumb = row.exdbId
-    ? `<img src="${escapeHtml(exdbGifUrl(row.exdbId))}" alt="" loading="lazy" class="h-20 w-20 shrink-0 rounded-xl bg-white object-contain">`
-    : `<div class="flex h-20 w-20 shrink-0 items-center justify-center rounded-xl border border-dashed border-zinc-700 text-center text-[11px] text-zinc-500">No match</div>`;
+  const thumb = exdbThumb(row.exdbId, "h-20 w-20", "No match");
   const picker = open ? (() => {
     const q = linksPage.query || row.name;
     // The current match stays first, so it is easy to keep.
-    const current = row.exdbId && !linksPage.query ? linksPage.exdb.find((e) => e.id === row.exdbId) : null;
-    const hits = [current, ...linkSuggestions(q).filter((e) => !current || e.id !== current.id)].filter(Boolean).slice(0, 8);
+    const current = row.exdbId && !linksPage.query ? linksPage.byId.get(row.exdbId) : null;
+    const hits = [current, ...linkSuggestions(q).filter((e) => !current || e.name.toLowerCase() !== current.name.toLowerCase())].filter(Boolean).slice(0, 12);
     return `<div class="mt-3 rounded-xl border border-zinc-700 bg-zinc-950 p-3">
-      <input data-link-query="${escapeHtml(row.id)}" value="${escapeHtml(q)}" placeholder="Search ExerciseDB" class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
-      <div class="mt-2 space-y-1">${hits.length ? hits.map((ex) => `
-        <button type="button" data-link-pick="${escapeHtml(row.id)}" data-exdb="${escapeHtml(ex.id)}" class="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left hover:bg-zinc-800 ${ex.id === row.exdbId ? "bg-emerald-500/10" : ""}">
-          <img src="${escapeHtml(exdbGifUrl(ex.id))}" alt="" loading="lazy" class="h-12 w-12 shrink-0 rounded-md bg-white object-contain">
-          <span class="min-w-0"><span class="block text-sm font-semibold text-zinc-100">${escapeHtml(ex.name)}</span><span class="block text-xs text-zinc-500">${escapeHtml([...(ex.equipment || []), ...(ex.target || [])].map(titleCase).join(" · "))}</span></span>
-        </button>`).join("") : `<div class="px-2 py-2 text-sm text-zinc-500">Nothing found. Try other words, e.g. "machine row".</div>`}</div>
+      <input data-link-query="${escapeHtml(row.id)}" value="${escapeHtml(q)}" placeholder="Search ExerciseDB, e.g. leg extension" class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
+      <div class="mt-2 text-xs text-zinc-500">Tap the animation to use for ${escapeHtml(row.name)}. Its name stays ${escapeHtml(row.name)}.</div>
+      <div class="mt-2 space-y-1.5">${hits.length ? hits.map((ex) => {
+        const isCurrent = ex.id === row.exdbId;
+        return `
+        <button type="button" data-link-pick="${escapeHtml(row.id)}" data-exdb="${escapeHtml(ex.id)}" class="flex w-full items-center gap-3 rounded-xl border px-2 py-2 text-left transition ${isCurrent ? "border-emerald-500/40 bg-emerald-500/10" : "border-zinc-800 hover:border-zinc-600 hover:bg-zinc-900"}">
+          ${exdbThumb(ex.id, "h-14 w-14", "")}
+          <span class="min-w-0 flex-1"><span class="block text-sm font-semibold text-zinc-100">${escapeHtml(ex.name)}</span><span class="block text-xs text-zinc-500">${escapeHtml([...(ex.equipment || []), ...(ex.target || [])].map(titleCase).join(" · "))}</span></span>
+          <span class="shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${isCurrent ? "border border-emerald-500/40 text-emerald-300" : "bg-emerald-600 text-white"}">${isCurrent ? "Current" : "Use this"}</span>
+        </button>`;
+      }).join("") : `<div class="px-2 py-2 text-sm text-zinc-500">Nothing found. Try other words, e.g. "machine row".</div>`}</div>
       <div class="mt-2 flex flex-wrap gap-3 text-sm"><button type="button" data-link-none="${escapeHtml(row.id)}" class="text-zinc-400 hover:text-white">No match in ExerciseDB</button><button type="button" data-link-close-picker class="text-zinc-500 hover:text-white">Cancel</button></div>
     </div>`;
   })() : "";
@@ -4679,6 +4709,7 @@ function linkRowHtml(row) {
           <div class="mt-0.5 text-sm text-zinc-300">${row.exdbId ? `<span class="text-zinc-500">Animation from:</span> ${escapeHtml(titleCase(row.exdbName || ""))}` : `<span class="text-zinc-500">No animation linked</span>`}</div>
           <div class="mt-2 flex flex-wrap items-center gap-2">
             <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold ${status.cls}">${status.label}</span>
+            ${linksPage.saved.has(row.id) ? `<span class="text-xs font-semibold text-emerald-400"><i class="fa-solid fa-check mr-1"></i>Saved</span>` : ""}
             ${row.matchedBy !== "you" ? `<button type="button" data-link-ok="${escapeHtml(row.id)}" class="rounded-lg border border-emerald-500/40 px-2.5 py-1 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/10">Looks right</button>` : ""}
             <button type="button" data-link-change="${escapeHtml(row.id)}" class="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-200 hover:border-zinc-500">${open ? "Close" : "Change"}</button>
             ${row.exdbId ? `<button type="button" class="text-xs text-zinc-500 hover:text-zinc-300" data-exercise-card="${escapeHtml(row.id)}" data-exercise-name="${escapeHtml(row.name)}">Steps</button>` : ""}
@@ -4699,9 +4730,13 @@ function renderExerciseLinksPage() {
   const counts = { all: linksPage.rows.length, check: linksPage.rows.filter(toCheck).length, you: linksPage.rows.filter((r) => r.matchedBy === "you").length };
   const term = linksPage.search.trim().toLowerCase();
   const rows = linksPage.rows
-    .filter((r) => (linksPage.filter === "check" ? toCheck(r) : linksPage.filter === "you" ? r.matchedBy === "you" : true))
+    // A row you have just saved stays in view (marked Saved) until you switch lists.
+    .filter((r) => linksPage.saved.has(r.id) || (linksPage.filter === "check" ? toCheck(r) : linksPage.filter === "you" ? r.matchedBy === "you" : true))
     .filter((r) => !term || r.name.toLowerCase().includes(term) || String(r.exdbName || "").toLowerCase().includes(term))
-    .sort((a, b) => (LINK_STATUS[a.matchedBy]?.order ?? 2) - (LINK_STATUS[b.matchedBy]?.order ?? 2) || (Number(b.sessions) || 0) - (Number(a.sessions) || 0) || a.name.localeCompare(b.name));
+    .sort((a, b) => {
+      const order = (r) => LINK_STATUS[linksPage.saved.has(r.id) ? linksPage.saved.get(r.id) : r.matchedBy]?.order ?? 2;
+      return order(a) - order(b) || (Number(b.sessions) || 0) - (Number(a.sessions) || 0) || a.name.localeCompare(b.name);
+    });
   const chip = (key, label) => `<button type="button" data-links-filter="${key}" class="rounded-full border px-3 py-1.5 text-xs font-semibold ${linksPage.filter === key ? "border-emerald-500 bg-emerald-500/15 text-emerald-300" : "border-zinc-700 text-zinc-400 hover:text-zinc-200"}">${label} <span class="opacity-60">${counts[key]}</span></button>`;
   box.innerHTML = `
     <div class="mb-4 flex flex-wrap items-center gap-2">
@@ -4719,10 +4754,11 @@ function renderExerciseLinksPage() {
 async function saveExerciseLink(rowId, exdbId) {
   const row = linksPage.rows.find((r) => r.id === rowId);
   if (!row) return;
-  const ex = exdbId ? linksPage.exdb.find((e) => e.id === exdbId) : null;
+  const ex = exdbId ? linksPage.byId.get(exdbId) : null;
   const next = { name: row.name, exdbId: ex ? ex.id : null, exdbName: ex ? ex.name.toLowerCase() : null, matchedBy: "you", sessions: Number(row.sessions) || 0, updatedAt: serverTimestamp() };
   try {
     await setDoc(doc(db, "users", currentUser.uid, "exercise_links", rowId), next);
+    if (!linksPage.saved.has(rowId)) linksPage.saved.set(rowId, row.matchedBy);
     Object.assign(row, next);
     exerciseLinksPromise = null; // search and the exercise card pick up the new link
     if (linksPage.openRow === rowId) {
@@ -4741,7 +4777,7 @@ document.getElementById("exerciseLinksPage")?.addEventListener("click", (event) 
   if (!linksPage) return;
   const t = event.target.closest("[data-links-filter],[data-link-ok],[data-link-change],[data-link-pick],[data-link-none],[data-link-close-picker]");
   if (!t) return;
-  if (t.hasAttribute("data-links-filter")) { linksPage.filter = t.getAttribute("data-links-filter"); renderExerciseLinksPage(); return; }
+  if (t.hasAttribute("data-links-filter")) { linksPage.filter = t.getAttribute("data-links-filter"); linksPage.saved.clear(); renderExerciseLinksPage(); return; }
   if (t.hasAttribute("data-link-ok")) { const row = linksPage.rows.find((r) => r.id === t.getAttribute("data-link-ok")); if (row) saveExerciseLink(row.id, row.exdbId); return; }
   if (t.hasAttribute("data-link-change")) {
     const id = t.getAttribute("data-link-change");
