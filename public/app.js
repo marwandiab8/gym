@@ -4676,7 +4676,7 @@ function linkRowHtml(row) {
         ${thumb}
         <div class="min-w-0 flex-1">
           <div class="font-semibold leading-snug text-zinc-100">${escapeHtml(row.name)} <span class="text-xs font-normal text-zinc-500">· ${Number(row.sessions) || 0} session${Number(row.sessions) === 1 ? "" : "s"}</span></div>
-          <div class="mt-0.5 text-sm text-zinc-300"><i class="fa-solid fa-arrow-right mr-1.5 text-[10px] text-zinc-600"></i>${row.exdbId ? escapeHtml(titleCase(row.exdbName || "")) : `<span class="text-zinc-500">No match</span>`}</div>
+          <div class="mt-0.5 text-sm text-zinc-300">${row.exdbId ? `<span class="text-zinc-500">Animation from:</span> ${escapeHtml(titleCase(row.exdbName || ""))}` : `<span class="text-zinc-500">No animation linked</span>`}</div>
           <div class="mt-2 flex flex-wrap items-center gap-2">
             <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold ${status.cls}">${status.label}</span>
             ${row.matchedBy !== "you" ? `<button type="button" data-link-ok="${escapeHtml(row.id)}" class="rounded-lg border border-emerald-500/40 px-2.5 py-1 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/10">Looks right</button>` : ""}
