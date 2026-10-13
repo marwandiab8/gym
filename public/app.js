@@ -4646,7 +4646,8 @@ async function loadExerciseLinksPage() {
     });
     const opened = location.hash.match(/^#ex=(.+)$/);
     // saved: rows changed on this visit -> their status before, so they stay where they were (marked Saved).
-    linksPage = { rows, exdb, byId: new Map(exdb.map((e) => [e.id, e])), filter: "all", search: "", openRow: opened ? decodeURIComponent(opened[1]) : null, query: "", saved: new Map() };
+    linksPage = { rows, exdb, byId: new Map(exdb.map((e) => [e.id, e])), filter: "all", search: "", saved: new Map() };
+    resetLinkPicker(opened ? decodeURIComponent(opened[1]) : null);
     renderExerciseLinksPage();
     if (linksPage.openRow) document.querySelector(`[data-link-row="${CSS.escape(linksPage.openRow)}"]`)?.scrollIntoView({ block: "center" });
   } catch (err) {
@@ -4654,17 +4655,62 @@ async function loadExerciseLinksPage() {
   }
 }
 
-function linkSuggestions(text) {
-  const expanded = expandQueryWithAliases(normalizeSearchText(text));
-  if (!expanded) return [];
-  return linksPage.exdb
-    .map((ex) => ({ ex, score: scoreExerciseAgainstQuery(expanded, ex.name, [...(ex.equipment || []), ...(ex.target || []), ...(ex.bodyParts || [])]) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .map((x) => x.ex)
-    // ExerciseDB has a few exercises twice under the same name: show each name once.
-    .filter((ex, i, list) => list.findIndex((o) => o.name.toLowerCase() === ex.name.toLowerCase()) === i)
-    .slice(0, 12);
+// The picker on an open row: search all of ExerciseDB, narrow it by body part and equipment, and page
+// through every match. `query` null means untouched (it starts as the exercise's own name); "" lists all.
+const LINK_PICKER_PAGE = 20;
+
+function resetLinkPicker(openRow) {
+  Object.assign(linksPage, { openRow, query: null, part: "", equip: "", shown: LINK_PICKER_PAGE });
+}
+
+/** Every ExerciseDB exercise that fits the picker's search and filters, best first; one per name. */
+function linkPickerResults(row) {
+  const q = linksPage.query == null ? row.name : linksPage.query;
+  const fits = linksPage.exdb.filter((ex) => (!linksPage.part || (ex.bodyParts || []).includes(linksPage.part)) && (!linksPage.equip || (ex.equipment || []).includes(linksPage.equip)));
+  const expanded = expandQueryWithAliases(normalizeSearchText(q));
+  const split = (text) => normalizeSearchText(text).split(/[\s-]+/).filter(Boolean);
+  const tokens = [...new Set(split(expanded))];
+  let list;
+  if (!tokens.length) list = [...fits].sort((a, b) => a.name.localeCompare(b.name));
+  else {
+    // Exercises with any of the words - a word starts with it ("ext" finds Extension, "rows" finds Row) - in
+    // the name, equipment or muscles. Most words first, then words in the name, then the later words (the
+    // movement: "extension" in "single leg extension"). A word no exercise has is matched by near spellings
+    // ("extnsion").
+    const found = (t, w) => w.startsWith(t) || (w.length >= 3 && t.startsWith(w) && t.length - w.length <= 2);
+    const near = (t, w) => t.length >= 4 && Math.abs(t.length - w.length) <= 2 && levenshtein(t, w) <= (t.length >= 7 ? 2 : 1);
+    const phrase = normalizeSearchText(q);
+    const prepared = fits.map((ex) => {
+      const nameWords = split(ex.name);
+      return { ex, nameWords, words: [...nameWords, ...[...(ex.equipment || []), ...(ex.target || []), ...(ex.bodyParts || [])].flatMap(split)] };
+    });
+    const matchers = tokens.map((t) => (prepared.some((x) => x.words.some((w) => found(t, w))) ? found : near));
+    const matches = prepared.map(({ ex, nameWords, words }) => {
+      let hits = 0;
+      let rank = 0;
+      tokens.forEach((t, i) => {
+        // A word under 3 letters ("up") only counts in the name, not in "upper legs".
+        if (!(t.length < 3 ? nameWords : words).some((w) => matchers[i](t, w))) return;
+        hits += 1;
+        if (nameWords.some((w) => matchers[i](t, w))) rank += 10 + (3 * (i + 1)) / tokens.length;
+      });
+      return { ex, hits, rank: hits * 100 + rank + (normalizeSearchText(ex.name).includes(phrase) ? 5 : 0) - ex.name.length * 0.01 };
+    }).filter((x) => x.hits);
+    list = matches.sort((a, b) => b.rank - a.rank).map((x) => x.ex);
+  }
+  // The current match comes first while the search is untouched or cleared, so it is easy to keep.
+  const current = row.exdbId && !linksPage.query ? fits.find((e) => e.id === row.exdbId) : null;
+  if (current) list = [current, ...list.filter((e) => e !== current)];
+  // ExerciseDB has a few exercises twice under the same name: show each name once.
+  const seen = new Set();
+  return list.filter((ex) => !seen.has(ex.name.toLowerCase()) && seen.add(ex.name.toLowerCase()));
+}
+
+function linkPickerOptions(field, chosen, allLabel) {
+  const counts = new Map();
+  for (const ex of linksPage.exdb) for (const v of ex[field] || []) counts.set(v, (counts.get(v) || 0) + 1);
+  return `<option value="">${allLabel}</option>` + [...counts.keys()].sort((a, b) => a.localeCompare(b))
+    .map((v) => `<option value="${escapeHtml(v)}"${v === chosen ? " selected" : ""}>${escapeHtml(titleCase(v))} (${counts.get(v)})</option>`).join("");
 }
 
 /** An ExerciseDB animation thumbnail, or a box saying there is none. */
@@ -4681,13 +4727,21 @@ function linkRowHtml(row) {
   const open = linksPage.openRow === row.id;
   const thumb = exdbThumb(row.exdbId, "h-20 w-20", "No match");
   const picker = open ? (() => {
-    const q = linksPage.query || row.name;
-    // The current match stays first, so it is easy to keep.
-    const current = row.exdbId && !linksPage.query ? linksPage.byId.get(row.exdbId) : null;
-    const hits = [current, ...linkSuggestions(q).filter((e) => !current || e.name.toLowerCase() !== current.name.toLowerCase())].filter(Boolean).slice(0, 12);
+    const q = linksPage.query == null ? row.name : linksPage.query;
+    const results = linkPickerResults(row);
+    const hits = results.slice(0, linksPage.shown);
+    const left = results.length - hits.length;
+    const select = "min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none";
     return `<div class="mt-3 rounded-xl border border-zinc-700 bg-zinc-950 p-3">
-      <input data-link-query="${escapeHtml(row.id)}" value="${escapeHtml(q)}" placeholder="Search ExerciseDB, e.g. leg extension" class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
-      <div class="mt-2 text-xs text-zinc-500">Tap the animation to use for ${escapeHtml(row.name)}. Its name stays ${escapeHtml(row.name)}.</div>
+      <div class="flex gap-2">
+        <input data-link-query="${escapeHtml(row.id)}" value="${escapeHtml(q)}" placeholder="Search all ${linksPage.exdb.length.toLocaleString()} exercises" class="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
+        ${q ? `<button type="button" data-link-clear="${escapeHtml(row.id)}" class="shrink-0 rounded-lg border border-zinc-700 px-3 text-xs font-semibold text-zinc-300 hover:border-zinc-500">Clear</button>` : ""}
+      </div>
+      <div class="mt-2 flex gap-2">
+        <select data-link-part="${escapeHtml(row.id)}" aria-label="Body part" class="${select}">${linkPickerOptions("bodyParts", linksPage.part, "All body parts")}</select>
+        <select data-link-equip="${escapeHtml(row.id)}" aria-label="Equipment" class="${select}">${linkPickerOptions("equipment", linksPage.equip, "All equipment")}</select>
+      </div>
+      <div class="mt-2 text-xs text-zinc-500">${results.length.toLocaleString()} exercise${results.length === 1 ? "" : "s"}${q ? "" : linksPage.part || linksPage.equip ? "" : " - all of ExerciseDB"}. Tap the animation to use for ${escapeHtml(row.name)}; its name stays ${escapeHtml(row.name)}.</div>
       <div class="mt-2 space-y-1.5">${hits.length ? hits.map((ex) => {
         const isCurrent = ex.id === row.exdbId;
         return `
@@ -4696,7 +4750,8 @@ function linkRowHtml(row) {
           <span class="min-w-0 flex-1"><span class="block text-sm font-semibold text-zinc-100">${escapeHtml(ex.name)}</span><span class="block text-xs text-zinc-500">${escapeHtml([...(ex.equipment || []), ...(ex.target || [])].map(titleCase).join(" · "))}</span></span>
           <span class="shrink-0 rounded-full px-3 py-1 text-xs font-semibold ${isCurrent ? "border border-emerald-500/40 text-emerald-300" : "bg-emerald-600 text-white"}">${isCurrent ? "Current" : "Use this"}</span>
         </button>`;
-      }).join("") : `<div class="px-2 py-2 text-sm text-zinc-500">Nothing found. Try other words, e.g. "machine row".</div>`}</div>
+      }).join("") : `<div class="px-2 py-2 text-sm text-zinc-500">Nothing found. Try other words, or Clear to see everything${linksPage.part || linksPage.equip ? " for this body part and equipment" : ""}.</div>`}</div>
+      ${left > 0 ? `<button type="button" data-link-more="${escapeHtml(row.id)}" class="mt-2 w-full rounded-xl border border-zinc-700 px-3 py-2.5 text-sm font-semibold text-zinc-200 hover:border-zinc-500">Show ${Math.min(left, LINK_PICKER_PAGE)} more <span class="font-normal text-zinc-500">(${left.toLocaleString()} left)</span></button>` : ""}
       <div class="mt-2 flex flex-wrap gap-3 text-sm"><button type="button" data-link-none="${escapeHtml(row.id)}" class="text-zinc-400 hover:text-white">No match in ExerciseDB</button><button type="button" data-link-close-picker class="text-zinc-500 hover:text-white">Cancel</button></div>
     </div>`;
   })() : "";
@@ -4763,8 +4818,7 @@ async function saveExerciseLink(rowId, exdbId) {
     exerciseLinksPromise = null; // search and the exercise card pick up the new link
     if (linksPage.openRow === rowId) {
       // Close this row's picker - but not one you have opened on another row meanwhile.
-      linksPage.openRow = null;
-      linksPage.query = "";
+      resetLinkPicker(null);
     }
     renderExerciseLinksPage();
     setStatus(ex ? `${row.name} → ${ex.name}` : `${row.name}: no match`, "info");
@@ -4775,36 +4829,53 @@ async function saveExerciseLink(rowId, exdbId) {
 
 document.getElementById("exerciseLinksPage")?.addEventListener("click", (event) => {
   if (!linksPage) return;
-  const t = event.target.closest("[data-links-filter],[data-link-ok],[data-link-change],[data-link-pick],[data-link-none],[data-link-close-picker]");
+  const t = event.target.closest("[data-links-filter],[data-link-ok],[data-link-change],[data-link-pick],[data-link-none],[data-link-close-picker],[data-link-more],[data-link-clear]");
   if (!t) return;
   if (t.hasAttribute("data-links-filter")) { linksPage.filter = t.getAttribute("data-links-filter"); linksPage.saved.clear(); renderExerciseLinksPage(); return; }
   if (t.hasAttribute("data-link-ok")) { const row = linksPage.rows.find((r) => r.id === t.getAttribute("data-link-ok")); if (row) saveExerciseLink(row.id, row.exdbId); return; }
   if (t.hasAttribute("data-link-change")) {
     const id = t.getAttribute("data-link-change");
-    linksPage.openRow = linksPage.openRow === id ? null : id;
-    linksPage.query = "";
+    resetLinkPicker(linksPage.openRow === id ? null : id);
     renderExerciseLinksPage();
     return;
   }
   if (t.hasAttribute("data-link-pick")) { saveExerciseLink(t.getAttribute("data-link-pick"), t.getAttribute("data-exdb")); return; }
   if (t.hasAttribute("data-link-none")) { saveExerciseLink(t.getAttribute("data-link-none"), null); return; }
-  if (t.hasAttribute("data-link-close-picker")) { linksPage.openRow = null; linksPage.query = ""; renderExerciseLinksPage(); }
+  if (t.hasAttribute("data-link-close-picker")) { resetLinkPicker(null); renderExerciseLinksPage(); return; }
+  if (t.hasAttribute("data-link-more")) { linksPage.shown += LINK_PICKER_PAGE; redrawLinkRow(t.getAttribute("data-link-more")); return; }
+  if (t.hasAttribute("data-link-clear")) { linksPage.query = ""; linksPage.shown = LINK_PICKER_PAGE; redrawLinkRow(t.getAttribute("data-link-clear")); }
 });
 document.getElementById("exerciseLinksPage")?.addEventListener("input", (event) => {
   if (!linksPage) return;
   if (event.target.id === "linksSearch") { linksPage.search = event.target.value; renderExerciseLinksPage(); return; }
   if (event.target.hasAttribute("data-link-query")) {
     linksPage.query = event.target.value;
-    const id = event.target.getAttribute("data-link-query");
-    const row = linksPage.rows.find((r) => r.id === id);
-    const el = document.querySelector(`[data-link-row="${CSS.escape(id)}"]`);
-    if (!row || !el) return;
-    const caret = event.target.selectionStart;
-    el.outerHTML = linkRowHtml(row);
-    const input = document.querySelector(`[data-link-query="${CSS.escape(id)}"]`);
-    if (input) { input.focus(); input.setSelectionRange(caret, caret); }
+    linksPage.shown = LINK_PICKER_PAGE;
+    redrawLinkRow(event.target.getAttribute("data-link-query"), true, event.target.selectionStart);
   }
 });
+document.getElementById("exerciseLinksPage")?.addEventListener("change", (event) => {
+  if (!linksPage) return;
+  const id = event.target.getAttribute("data-link-part") || event.target.getAttribute("data-link-equip");
+  if (!id) return;
+  linksPage[event.target.hasAttribute("data-link-part") ? "part" : "equip"] = event.target.value;
+  linksPage.shown = LINK_PICKER_PAGE;
+  redrawLinkRow(id);
+});
+
+/** Redraws one row in place (the rest of the page and the scroll position stay), focusing its search if asked. */
+function redrawLinkRow(id, focusSearch = false, caret = null) {
+  const row = linksPage.rows.find((r) => r.id === id);
+  const el = document.querySelector(`[data-link-row="${CSS.escape(id)}"]`);
+  if (!row || !el) return;
+  el.outerHTML = linkRowHtml(row);
+  const input = focusSearch && document.querySelector(`[data-link-query="${CSS.escape(id)}"]`);
+  if (input) {
+    input.focus();
+    const at = caret == null ? input.value.length : caret;
+    input.setSelectionRange(at, at);
+  }
+}
 
 function renderExerciseLinksSignedOut() {
   const box = document.getElementById("exerciseLinksPage");
