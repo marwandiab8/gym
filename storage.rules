@@ -1,0 +1,17 @@
+rules_version = '2';
+// Machine photos (machines.html): each user's own reference photos of gym machines, at
+// users/{uid}/machine-photos/{photoId}.jpg. The app resizes them to at most 1600 px before uploading.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{userId}/machine-photos/{fileName} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create, update: if request.auth != null && request.auth.uid == userId
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

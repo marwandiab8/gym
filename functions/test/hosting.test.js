@@ -5,7 +5,7 @@ const path = require("node:path");
 
 const publicDir = path.resolve(__dirname, "../../public");
 const read = (file) => fs.readFileSync(path.join(publicDir, file), "utf8");
-const pages = ["index.html", "progress.html", "prs.html", "settings.html"];
+const pages = ["index.html", "progress.html", "prs.html", "settings.html", "machines.html", "exercise-links.html"];
 
 function shippedFiles(dir = publicDir, base = "") {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {

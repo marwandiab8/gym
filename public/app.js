@@ -1,7 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-import { getFirestore, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, writeBatch, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
-import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut, connectAuthEmulator, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore, connectFirestoreEmulator, doc, setDoc, collection, addDoc, getDoc, getDocs, query, where, onSnapshot, serverTimestamp, deleteDoc, updateDoc, writeBatch, limit, orderBy, getCountFromServer, startAfter, waitForPendingWrites } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getFunctions, httpsCallable, connectFunctionsEmulator } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js";
 import {
   completedExerciseSetRows,
   filterScorableSets,
@@ -44,6 +44,15 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const functions = getFunctions(app);
+// Local testing only: on localhost with ?emulators=1 the app talks to the Firebase emulators, and
+// window.__testSignIn(email, password) signs in a test user (Google sign-in can't run there).
+const USE_EMULATORS = ["localhost", "127.0.0.1"].includes(location.hostname) && new URLSearchParams(location.search).has("emulators");
+if (USE_EMULATORS) {
+  connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+  connectFirestoreEmulator(db, "127.0.0.1", 8080);
+  connectFunctionsEmulator(functions, "127.0.0.1", 5001);
+  window.__testSignIn = (email, password) => signInWithEmailAndPassword(auth, email, password);
+}
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
@@ -1184,6 +1193,8 @@ onAuthStateChanged(auth, async (user) => {
     renderRecentWorkoutsSignedOut();
     renderPrsSignedOut();
     renderProgressSignedOut();
+    renderMachinePhotosSignedOut();
+    renderExerciseLinksSignedOut();
     handleRouteChange();
     return;
   }
@@ -1192,6 +1203,8 @@ onAuthStateChanged(auth, async (user) => {
   );
   await runBootstrapStep("favorites", () => initFavoriteExercisesForUser());
   runBootstrapStep("prs page", async () => loadPrsPage());
+  runBootstrapStep("machine photos", async () => loadMachinePhotosPage());
+  runBootstrapStep("exercise links", async () => loadExerciseLinksPage());
   runBootstrapStep("analytics", () => loadAnalytics());
   runBootstrapStep("templates", () => loadTemplates());
   runBootstrapStep("integrity check", () => runIntegrityCheckIfDue());
@@ -1351,40 +1364,12 @@ function scoreExerciseAgainstQuery(expandedQueryNorm, exerciseName, keywordList)
   return score;
 }
 
-const CATALOG_KEYWORD_HIT_LIMIT = 80;
-const CATALOG_FALLBACK_LIMIT = 140;
 const CUSTOM_EXERCISE_CAP = 200;
-
-/**
- * Bounded catalog reads: keyword intersection when possible, otherwise a capped scan.
- * Avoids loading the entire `catalog_exercises` collection into the browser.
- */
-async function fetchCatalogDocsForSearch(expandedNorm) {
-  const tokens = searchTokenize(expandedNorm).slice(0, 10);
-  const byId = new Map();
-  if (tokens.length) {
-    try {
-      const qKw = query(
-        collection(db, "catalog_exercises"),
-        where("keywords", "array-contains-any", tokens),
-        limit(CATALOG_KEYWORD_HIT_LIMIT)
-      );
-      const snap = await getDocs(qKw);
-      snap.forEach((d) => byId.set(d.id, d));
-    } catch (_) {
-      /* Missing index or field — fall back below */
-    }
-  }
-  if (byId.size < 12) {
-    const qFb = query(collection(db, "catalog_exercises"), limit(CATALOG_FALLBACK_LIMIT));
-    const snap2 = await getDocs(qFb);
-    snap2.forEach((d) => byId.set(d.id, d));
-  }
-  return [...byId.values()];
-}
 
 /** Final scores combine token scores × weighting + substring bonuses (~30k for the weakest match that still passes per-token floor). */
 const SEARCH_MIN_SCORE = 30000;
+/** Your own exercises (with history) rank above an equally good ExerciseDB match. */
+const YOUR_EXERCISE_BONUS = 20000;
 
 /** Map exercise id → display meta for favorites strip (no duplicate exercise rows). */
 async function buildExerciseMetaMap() {
@@ -1395,6 +1380,14 @@ async function buildExerciseMetaMap() {
   customSnap.forEach((d) => {
     map.set(d.id, { name: d.data().name, subtitle: "Custom Exercise", isCustom: true });
   });
+  const [links, exdb] = await Promise.all([loadExerciseLinks(), loadExdbIndex()]);
+  for (const id of favoriteExerciseIdSet) {
+    if (map.has(id)) continue;
+    const link = links.get(id);
+    if (link) { map.set(id, { name: link.name, subtitle: link.exdbName ? `Yours · ${titleCase(link.exdbName)}` : "Yours", isCustom: false }); continue; }
+    const fromExdb = id.startsWith("exdb_") && exdb.find((ex) => ex.id === id);
+    if (fromExdb) map.set(id, { name: fromExdb.name, subtitle: [...(fromExdb.equipment || [])].map(titleCase).join(", "), isCustom: false });
+  }
   const favCatalogIds = [...favoriteExerciseIdSet].filter((id) => !map.has(id)).slice(0, 50);
   await Promise.all(
     favCatalogIds.map(async (id) => {
@@ -1501,25 +1494,28 @@ async function searchExercises(term) {
 
   try {
     const expanded = expandQueryWithAliases(t);
-    const [catalogDocs, customSnap] = await Promise.all([
-      fetchCatalogDocsForSearch(expanded),
+    // Your exercises (the ones in your history, under your names - picking one keeps its history and
+    // records), your custom exercises, then ExerciseDB. An ExerciseDB exercise linked to one of yours is
+    // folded into yours, so it never shows twice.
+    const [exdb, links, customSnap] = await Promise.all([
+      loadExdbIndex(),
+      loadExerciseLinks(),
       getDocs(query(collection(db, "users", currentUser.uid, "custom_exercises"), limit(CUSTOM_EXERCISE_CAP))),
     ]);
     const ranked = [];
-    catalogDocs.forEach((d) => {
-      const data = d.data();
-      const sc = scoreExerciseAgainstQuery(expanded, data.name, data.keywords || []);
+    const linkedExdb = new Set();
+    for (const [id, link] of links) {
+      if (link.exdbId) linkedExdb.add(link.exdbId);
+      const sc = Math.max(
+        scoreExerciseAgainstQuery(expanded, link.name, []),
+        link.exdbName ? scoreExerciseAgainstQuery(expanded, link.exdbName, []) : 0
+      );
       if (sc >= SEARCH_MIN_SCORE) {
-        ranked.push({
-          id: d.id,
-          name: data.name,
-          subtitle: (data.equipmentNames || []).join(", "),
-          isCustom: false,
-          score: sc,
-        });
+        ranked.push({ id, name: link.name, subtitle: link.exdbName ? `Yours · ${titleCase(link.exdbName)}` : "Yours", isCustom: false, score: sc + YOUR_EXERCISE_BONUS });
       }
-    });
+    }
     customSnap.forEach(d => {
+      if (links.has(d.id)) return;
       const data = d.data();
       const sc = scoreExerciseAgainstQuery(expanded, data.name, [data.nameLower || "", data.name || ""]);
       if (sc >= SEARCH_MIN_SCORE) {
@@ -1532,6 +1528,13 @@ async function searchExercises(term) {
         });
       }
     });
+    for (const ex of exdb) {
+      if (linkedExdb.has(ex.id)) continue;
+      const sc = scoreExerciseAgainstQuery(expanded, ex.name, [...(ex.equipment || []), ...(ex.target || []), ...(ex.bodyParts || [])]);
+      if (sc >= SEARCH_MIN_SCORE) {
+        ranked.push({ id: ex.id, name: ex.name, subtitle: [...(ex.equipment || []), ...(ex.target || [])].map(titleCase).join(" · "), isCustom: false, score: sc });
+      }
+    }
     ranked.sort((a, b) => {
       const fa = favoriteExerciseIdSet.has(a.id) ? 1 : 0;
       const fb = favoriteExerciseIdSet.has(b.id) ? 1 : 0;
@@ -1606,17 +1609,24 @@ async function findOrCreateExerciseId(name) {
     const cS = await getDocs(cQ);
     if (!cS.empty) return { id: cS.docs[0].id, name: cS.docs[0].data().name };
     const expanded = expandQueryWithAliases(t);
-    const catDocs = await fetchCatalogDocsForSearch(expanded);
+    // Your exercises first (keeps their history), then ExerciseDB.
+    const [links, exdb] = await Promise.all([loadExerciseLinks(), loadExdbIndex()]);
     let best = null;
     let bestScore = -1;
-    catDocs.forEach((docSnap) => {
-      const data = docSnap.data();
-      const sc = scoreExerciseAgainstQuery(expanded, data.name, data.keywords || []);
+    const consider = (id, displayName, sc) => {
       if (sc > bestScore) {
         bestScore = sc;
-        best = { id: docSnap.id, name: data.name };
+        best = { id, name: displayName };
       }
-    });
+    };
+    const linkedExdb = new Set();
+    for (const [id, link] of links) {
+      if (link.exdbId) linkedExdb.add(link.exdbId);
+      consider(id, link.name, Math.max(scoreExerciseAgainstQuery(expanded, link.name, []), link.exdbName ? scoreExerciseAgainstQuery(expanded, link.exdbName, []) : 0) + YOUR_EXERCISE_BONUS);
+    }
+    for (const ex of exdb) {
+      if (!linkedExdb.has(ex.id)) consider(ex.id, ex.name, scoreExerciseAgainstQuery(expanded, ex.name, [...(ex.equipment || []), ...(ex.target || [])]));
+    }
     const FIND_OR_CREATE_MIN_SCORE = 30000;
     if (best && bestScore >= FIND_OR_CREATE_MIN_SCORE) return best;
     const newRef = await addDoc(collection(db, "users", currentUser.uid, "custom_exercises"), { name: name.trim(), nameLower: t, createdAt: serverTimestamp() });
@@ -2355,7 +2365,7 @@ function renderWorkoutBuilder() {
     if (ex.exerciseNote == null) ex.exerciseNote = "";
     const favOn = isExerciseFavorite(ex.exerciseId);
     card.innerHTML = `<div class="flex justify-between items-start gap-2 mb-2">
-      <div class="font-bold text-xl text-emerald-400 flex-1 min-w-0">${escapeHtml(ex.name)}</div>
+      <div class="font-bold text-xl text-emerald-400 flex-1 min-w-0">${exerciseNameButton(ex.exerciseId, ex.name)}</div>
       <div class="flex flex-col gap-1 shrink-0"><button type="button" class="ex-move-up ${MOVE_BTN_CLASS}" title="Move exercise up" aria-label="Move ${escapeHtml(ex.name)} up"${exIndex === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="ex-move-down ${MOVE_BTN_CLASS}" title="Move exercise down" aria-label="Move ${escapeHtml(ex.name)} down"${exIndex === workoutState.exercises.length - 1 ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button></div>
       <button type="button" class="ex-fav-toggle shrink-0 w-10 h-10 rounded-lg border border-zinc-600 hover:bg-zinc-800 text-amber-400 flex items-center justify-center" title="${favOn ? "Remove from favorites" : "Add to favorites"}" aria-label="Favorite"><i class="fa-star ${favOn ? "fa-solid" : "fa-regular"}"></i></button>
     </div>
@@ -2659,7 +2669,7 @@ function openPrDetail(exerciseId) {
   const recent = [...ex.sessions].reverse().slice(0, 5).map((s) => `<div class="border-t border-zinc-800 py-2 first:border-t-0"><div class="flex items-center justify-between text-xs"><span class="font-semibold text-zinc-300">${prShortDate(s.date)}</span>${s.pr ? prKindBadge(s.pr) : ""}</div><div class="mt-1 text-xs text-zinc-500">${s.sets.map(prSetText).join(" · ")}</div></div>`).join("");
   content.innerHTML = `
     <div class="mb-4 flex items-start justify-between gap-3">
-      <div class="min-w-0"><h3 class="text-xl font-bold text-white">${escapeHtml(ex.name)}</h3><div class="mt-0.5 text-xs text-zinc-500">${ex.group} · ${ex.sessionCount} session${ex.sessionCount === 1 ? "" : "s"} since ${prShortDate(ex.firstDate)} · ${ex.prs.length} PR${ex.prs.length === 1 ? "" : "s"}</div></div>
+      <div class="min-w-0"><h3 class="text-xl font-bold text-white">${exerciseNameButton(ex.id, ex.name)}</h3><div class="mt-0.5 text-xs text-zinc-500">${ex.group} · ${ex.sessionCount} session${ex.sessionCount === 1 ? "" : "s"} since ${prShortDate(ex.firstDate)} · ${ex.prs.length} PR${ex.prs.length === 1 ? "" : "s"}</div></div>
       <button type="button" data-pr-close class="-mr-1 rounded-lg p-2 text-zinc-500 outline-none transition hover:bg-zinc-800 hover:text-white focus-visible:ring-2 focus-visible:ring-zinc-500" aria-label="Close"><i class="fa-solid fa-xmark text-lg"></i></button>
     </div>
     <div class="mb-4">${prStatusChip(ex)}</div>
@@ -3373,7 +3383,7 @@ function showWorkoutDetailsModal(workout, displayDate) {
         if (tStart && tEnd && Math.abs(tEnd - tStart) > 60000) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)} - ${formatTimeDisplay(tEnd)}</span>`; } else if (tStart) { timeHtml = `<span class="text-xs text-zinc-500 font-normal ml-auto bg-zinc-800 px-2 py-1 rounded"><i class="fa-regular fa-clock mr-1"></i> ${formatTimeDisplay(tStart)}</span>`; }
         const exNote = (ex.exerciseNote && String(ex.exerciseNote).trim()) ? `<div class="text-sm text-zinc-400 mb-3 pl-1 border-l-2 border-emerald-500/50 py-1"><span class="text-zinc-500 text-xs uppercase tracking-wide mr-2">Notes</span>${escapeHtml(ex.exerciseNote)}</div>` : "";
         const hrChip = exercisesHaveTimes ? `<span data-hr-ex="${exIndex}" class="hidden items-center gap-1.5 text-xs text-rose-300 font-normal bg-rose-500/10 px-2 py-1 rounded"></span>` : "";
-        contentHtml += `<div class="mb-6"><div class="font-bold text-lg text-zinc-100 mb-3 flex flex-wrap items-center gap-2">${escapeHtml(ex.name)} <span class="ml-auto flex flex-wrap items-center justify-end gap-2">${timeHtml}${hrChip}</span></div>${exNote}`;
+        contentHtml += `<div class="mb-6"><div class="font-bold text-lg text-zinc-100 mb-3 flex flex-wrap items-center gap-2">${ex.exerciseId ? exerciseNameButton(ex.exerciseId, ex.name) : escapeHtml(ex.name)} <span class="ml-auto flex flex-wrap items-center justify-end gap-2">${timeHtml}${hrChip}</span></div>${exNote}`;
         if (ex.summaryOnly) {
             const bestWeight = Number(ex.bestWeight) || 0;
             const bestReps = Number(ex.bestReps) || 0;
@@ -4253,6 +4263,517 @@ document.getElementById("progressPage")?.addEventListener("change", (event) => {
   progressState.exerciseId = event.target.value;
   renderProgressExerciseChart();
 });
+
+// ==================== EXERCISE CARD & MACHINE PHOTOS ====================
+// Tap an exercise's name (in a workout, a workout's details, or its records) to see your photo of its
+// machine and, when it is linked to ExerciseDB, how the movement is done. Nothing shows until you tap.
+// Machine photos are uploaded and tagged on machines.html; ExerciseDB comes from data/exercisedb-index.json
+// (search) and the `exercisedb` collection (details).
+const STORAGE_SDK_URL = "https://www.gstatic.com/firebasejs/10.12.5/firebase-storage.js";
+const EXDB_INDEX_URL = "/data/exercisedb-index.json";
+const MACHINE_PHOTO_MAX_PX = 1600;
+const MACHINE_UPLOADS_AT_ONCE = 3;
+let storageApiPromise = null;
+let exdbIndexPromise = null;
+let exerciseLinksPromise = null;
+
+function storageApi() {
+  if (!storageApiPromise) {
+    storageApiPromise = import(STORAGE_SDK_URL).then((m) => {
+      const storage = m.getStorage(app);
+      if (USE_EMULATORS) m.connectStorageEmulator(storage, "127.0.0.1", 9199);
+      return { ...m, storage };
+    });
+  }
+  return storageApiPromise;
+}
+
+/** ExerciseDB's exercises for search and pickers: [{ id: "exdb_…", name, equipment, target, bodyParts }]. */
+function loadExdbIndex() {
+  if (!exdbIndexPromise) {
+    exdbIndexPromise = fetch(EXDB_INDEX_URL)
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => []);
+  }
+  return exdbIndexPromise;
+}
+
+/** Your exercises linked to ExerciseDB: Map exerciseId -> { name, exdbId, exdbName }. */
+function loadExerciseLinks() {
+  if (!currentUser) return Promise.resolve(new Map());
+  if (!exerciseLinksPromise) {
+    exerciseLinksPromise = getDocs(collection(db, "users", currentUser.uid, "exercise_links"))
+      .then((snap) => new Map(snap.docs.map((d) => [d.id, d.data()])))
+      .catch(() => new Map());
+  }
+  return exerciseLinksPromise;
+}
+
+/** An exercise name you can tap for its card (looks like plain text - no icon). */
+function exerciseNameButton(id, name, className = "") {
+  return `<button type="button" class="exercise-name-btn text-left ${className}" data-exercise-card="${escapeHtml(id)}" data-exercise-name="${escapeHtml(name)}">${escapeHtml(name)}</button>`;
+}
+
+function exerciseCardDialog() {
+  let dialog = document.getElementById("exerciseCardDialog");
+  if (dialog) return dialog;
+  dialog = document.createElement("dialog");
+  dialog.id = "exerciseCardDialog";
+  dialog.className = "m-auto w-[calc(100%-1.5rem)] max-w-md rounded-3xl border border-zinc-700 bg-[#111] p-0 text-zinc-100 shadow-2xl backdrop:bg-black/80";
+  dialog.innerHTML = `<div id="exerciseCardContent" class="max-h-[85vh] overflow-y-auto p-5"></div>`;
+  // Tap away (the backdrop) or the ✕ closes it.
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog || event.target.closest("[data-card-close]")) dialog.close();
+  });
+  document.body.appendChild(dialog);
+  return dialog;
+}
+
+const titleCase = (s) => String(s || "").replace(/\b([a-z])/g, (c) => c.toUpperCase());
+
+async function openExerciseCard(exerciseId, name) {
+  if (!currentUser || !exerciseId) return;
+  const dialog = exerciseCardDialog();
+  const content = dialog.querySelector("#exerciseCardContent");
+  const head = `<div class="mb-3 flex items-start justify-between gap-3"><h3 class="min-w-0 text-lg font-bold text-white">${escapeHtml(name)}</h3><button type="button" data-card-close class="-mr-1 rounded-lg p-2 text-zinc-500 outline-none transition hover:bg-zinc-800 hover:text-white focus-visible:ring-2 focus-visible:ring-zinc-500" aria-label="Close"><i class="fa-solid fa-xmark text-lg"></i></button></div>`;
+  content.innerHTML = `${head}<div class="py-6 text-center text-sm text-zinc-500">Loading…</div>`;
+  if (!dialog.open) dialog.showModal();
+  const [photos, links] = await Promise.all([
+    getDocs(query(collection(db, "users", currentUser.uid, "machine_photos"), where("exerciseId", "==", exerciseId)))
+      .then((snap) => snap.docs.map((d) => d.data()))
+      .catch(() => []),
+    loadExerciseLinks(),
+  ]);
+  const exdbId = exerciseId.startsWith("exdb_") ? exerciseId : links.get(exerciseId)?.exdbId || null;
+  const exdb = exdbId ? await getDoc(doc(db, "exercisedb", exdbId)).then((s) => (s.exists() ? s.data() : null)).catch(() => null) : null;
+  const photo = photos.sort((a, b) => (b.taggedAt?.toMillis?.() || 0) - (a.taggedAt?.toMillis?.() || 0))[0];
+  const parts = [];
+  if (photo) {
+    parts.push(`<img src="${escapeHtml(photo.url)}" alt="The machine for ${escapeHtml(name)}" class="w-full rounded-2xl border border-zinc-800 object-contain" style="max-height:60vh">`);
+  }
+  if (exdb) {
+    const muscles = [...(exdb.targetMuscles || []), ...(exdb.secondaryMuscles || [])].map(titleCase).join(", ");
+    parts.push(`<div class="${photo ? "mt-5 border-t border-zinc-800 pt-4" : ""}">
+      <div class="mb-2 text-xs font-bold uppercase tracking-wider text-zinc-500">How it's done${exdb.name && titleCase(exdb.name) !== name ? ` · ${escapeHtml(titleCase(exdb.name))}` : ""}</div>
+      ${exdb.gifUrl ? `<img src="${escapeHtml(exdb.gifUrl)}" alt="How to do ${escapeHtml(exdb.name || name)}" loading="lazy" class="mx-auto w-full max-w-[280px] rounded-xl bg-white">` : ""}
+      ${muscles ? `<div class="mt-3 text-sm text-zinc-300"><span class="text-zinc-500">Works:</span> ${escapeHtml(muscles)}</div>` : ""}
+      ${(exdb.equipments || []).length ? `<div class="mt-1 text-sm text-zinc-300"><span class="text-zinc-500">Equipment:</span> ${escapeHtml(exdb.equipments.map(titleCase).join(", "))}</div>` : ""}
+      ${(exdb.instructions || []).length ? `<details class="mt-3"><summary class="cursor-pointer select-none text-sm font-semibold text-emerald-400">Step by step</summary><ol class="mt-2 list-decimal space-y-1 pl-5 text-sm text-zinc-300">${exdb.instructions.map((step) => `<li>${escapeHtml(String(step).replace(/^Step:\d+\s*/, ""))}</li>`).join("")}</ol></details>` : ""}
+      <div class="mt-3 text-[11px] text-zinc-600">Animation and steps: ExerciseDB</div>
+    </div>`);
+  }
+  if (!photo) {
+    parts.push(`<div class="${exdb ? "mt-4" : ""} rounded-xl border border-dashed border-zinc-800 px-4 py-4 text-center text-sm text-zinc-500">No photo of this machine yet. <a href="machines.html" class="font-semibold text-emerald-400 hover:text-emerald-300">Add one</a></div>`);
+  }
+  if (!exerciseId.startsWith("exdb_")) {
+    parts.push(`<div class="mt-3 text-right text-xs"><a href="exercise-links.html#ex=${encodeURIComponent(exerciseId)}" class="text-zinc-500 hover:text-zinc-300">${exdb ? "Wrong animation? Change the match" : "Link it to ExerciseDB"}</a></div>`);
+  }
+  content.innerHTML = head + parts.join("");
+}
+
+document.addEventListener("click", (event) => {
+  const el = event.target.closest && event.target.closest("[data-exercise-card]");
+  if (!el) return;
+  event.preventDefault();
+  event.stopPropagation();
+  openExerciseCard(el.getAttribute("data-exercise-card"), el.getAttribute("data-exercise-name") || el.textContent.trim());
+});
+
+// ---- machines.html: upload a batch, tag each photo with its exercise, untagged ones wait ----
+let machinePage = null;
+
+/** A phone photo shrunk to at most 1600 px as a JPEG, upright. Returns { blob, width, height }. */
+async function shrinkMachinePhoto(file) {
+  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" }).catch(() => createImageBitmap(file));
+  const scale = Math.min(1, MACHINE_PHOTO_MAX_PX / Math.max(bitmap.width, bitmap.height));
+  const width = Math.max(1, Math.round(bitmap.width * scale));
+  const height = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, width, height);
+  if (bitmap.close) bitmap.close();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+  return { blob, width, height };
+}
+
+/** The exercises a photo can be tagged with: yours first (history and custom), then ExerciseDB. */
+async function machineExerciseChoices() {
+  const [links, customSnap, exdb] = await Promise.all([
+    loadExerciseLinks(),
+    getDocs(query(collection(db, "users", currentUser.uid, "custom_exercises"), limit(CUSTOM_EXERCISE_CAP))).catch(() => null),
+    loadExdbIndex(),
+  ]);
+  const byLabel = new Map();
+  const add = (label, id, name) => { if (label && !byLabel.has(label.toLowerCase())) byLabel.set(label.toLowerCase(), { label, id, name }); };
+  for (const [id, link] of links) add(link.name, id, link.name);
+  if (customSnap) customSnap.forEach((d) => add(d.data().name, d.id, d.data().name));
+  const linkedExdb = new Set([...links.values()].map((l) => l.exdbId).filter(Boolean));
+  for (const ex of exdb) if (!linkedExdb.has(ex.id)) add(`${ex.name} · ExerciseDB`, ex.id, ex.name);
+  return byLabel;
+}
+
+async function loadMachinePhotosPage() {
+  const box = document.getElementById("machinePhotosPage");
+  if (!box || !currentUser) return;
+  if (machinePage?.unsub) machinePage.unsub();
+  machinePage = { photos: [], uploads: [], drafts: new Map(), choices: new Map(), unsub: null };
+  machineExerciseChoices().then((choices) => { machinePage.choices = choices; renderMachineChoices(); });
+  machinePage.unsub = onSnapshot(
+    collection(db, "users", currentUser.uid, "machine_photos"),
+    (snap) => {
+      machinePage.photos = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+        .sort((a, b) => (b.createdAt?.toMillis?.() || Date.now()) - (a.createdAt?.toMillis?.() || Date.now()));
+      renderMachinePhotosPage();
+    },
+    (err) => { box.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your photos: ${escapeHtml(err.message || err)}</div>`; }
+  );
+}
+
+function renderMachineChoices() {
+  let list = document.getElementById("machineExerciseChoices");
+  if (!list) {
+    list = document.createElement("datalist");
+    list.id = "machineExerciseChoices";
+    document.body.appendChild(list);
+  }
+  list.innerHTML = [...machinePage.choices.values()].map((c) => `<option value="${escapeHtml(c.label)}"></option>`).join("");
+}
+
+function renderMachinePhotosPage() {
+  const box = document.getElementById("machinePhotosPage");
+  if (!box || !machinePage) return;
+  // Keep what you have typed in the untagged rows across redraws.
+  box.querySelectorAll("[data-photo-input]").forEach((input) => machinePage.drafts.set(input.getAttribute("data-photo-input"), input.value));
+  const untagged = machinePage.photos.filter((p) => p.status !== "tagged");
+  const tagged = machinePage.photos.filter((p) => p.status === "tagged").sort((a, b) => String(a.exerciseName).localeCompare(String(b.exerciseName)));
+  const untaggedHtml = untagged.length
+    ? `<div class="grid gap-3 sm:grid-cols-2">${untagged.map((p) => `
+        <div class="flex gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3">
+          <img src="${escapeHtml(p.url)}" alt="" class="h-24 w-24 shrink-0 rounded-xl object-cover" loading="lazy">
+          <div class="min-w-0 flex-1">
+            <input data-photo-input="${escapeHtml(p.id)}" list="machineExerciseChoices" value="${escapeHtml(machinePage.drafts.get(p.id) || "")}" placeholder="Which exercise?" class="w-full rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
+            <div class="mt-2 flex gap-2">
+              <button type="button" data-photo-save="${escapeHtml(p.id)}" class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-emerald-500">Save</button>
+              <button type="button" data-photo-delete="${escapeHtml(p.id)}" class="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-400 hover:text-red-300">Delete</button>
+            </div>
+          </div>
+        </div>`).join("")}</div>
+        <button type="button" data-photo-save-all class="mt-3 w-full rounded-xl border border-emerald-500/40 bg-emerald-500/10 py-2.5 text-sm font-semibold text-emerald-300 hover:bg-emerald-500/20">Save all filled in</button>`
+    : `<div class="rounded-xl border border-dashed border-zinc-800 px-4 py-5 text-center text-sm text-zinc-500">Nothing waiting. Every photo has its exercise.</div>`;
+  const taggedHtml = tagged.length
+    ? `<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">${tagged.map((p) => `
+        <div class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-2">
+          <button type="button" class="block w-full" data-exercise-card="${escapeHtml(p.exerciseId)}" data-exercise-name="${escapeHtml(p.exerciseName || "")}"><img src="${escapeHtml(p.url)}" alt="" class="aspect-square w-full rounded-xl object-cover" loading="lazy"></button>
+          <div class="mt-2 truncate text-sm font-semibold text-zinc-100" title="${escapeHtml(p.exerciseName || "")}">${escapeHtml(p.exerciseName || "")}</div>
+          <div class="mt-1 flex gap-3 text-xs"><button type="button" data-photo-untag="${escapeHtml(p.id)}" class="text-zinc-400 hover:text-white">Change</button><button type="button" data-photo-delete="${escapeHtml(p.id)}" class="text-zinc-500 hover:text-red-300">Delete</button></div>
+        </div>`).join("")}</div>`
+    : `<div class="text-sm text-zinc-500">None yet.</div>`;
+  box.innerHTML = `
+    <section>
+      <h2 class="mb-1 text-lg font-bold text-zinc-100">Untagged <span class="text-sm font-semibold text-zinc-500">${untagged.length}</span></h2>
+      <p class="mb-3 text-xs text-zinc-500">Pick or type the exercise next to each photo. A name that isn't an exercise yet becomes one of your custom exercises.</p>
+      ${untaggedHtml}
+    </section>
+    <section class="mt-8">
+      <h2 class="mb-3 text-lg font-bold text-zinc-100">Tagged <span class="text-sm font-semibold text-zinc-500">${tagged.length}</span></h2>
+      ${taggedHtml}
+    </section>`;
+}
+
+// The uploads in progress, under the Add photos button (kept out of the photo list, which redraws).
+function renderMachineUploads() {
+  const box = document.getElementById("machineUploads");
+  if (!box || !machinePage) return;
+  const shown = machinePage.uploads.filter((u) => !u.done);
+  box.innerHTML = shown.map((u) => `<div>${escapeHtml(u.name)}: ${u.error ? `<span class="text-red-300">${escapeHtml(u.error)}</span>` : u.progress >= 1 ? "saving…" : `${Math.round(u.progress * 100)}%`}</div>`).join("");
+}
+
+async function uploadMachinePhotos(files) {
+  const api = await storageApi();
+  const queue = [...files].filter((f) => /^image\//.test(f.type || "") || /\.(jpe?g|png|heic|heif|webp)$/i.test(f.name || ""));
+  const jobs = queue.map((file) => ({ file, name: file.name || "photo", progress: 0, done: false, error: "" }));
+  machinePage.uploads.push(...jobs);
+  renderMachineUploads();
+  const runOne = async (job) => {
+    try {
+      const { blob, width, height } = await shrinkMachinePhoto(job.file);
+      const photoRef = doc(collection(db, "users", currentUser.uid, "machine_photos"));
+      const storagePath = `users/${currentUser.uid}/machine-photos/${photoRef.id}.jpg`;
+      const task = api.uploadBytesResumable(api.ref(api.storage, storagePath), blob, { contentType: "image/jpeg" });
+      await new Promise((resolve, reject) => task.on("state_changed", (s) => {
+        job.progress = s.totalBytes ? s.bytesTransferred / s.totalBytes : 0;
+        renderMachineUploads();
+      }, reject, resolve));
+      // The photo is saved only once its upload has finished, so a saved photo always has its file.
+      const url = await api.getDownloadURL(task.snapshot.ref);
+      await setDoc(photoRef, { url, storagePath, status: "untagged", exerciseId: null, exerciseName: null, createdAt: serverTimestamp(), width, height, originalName: String(job.name).slice(0, 200) });
+      job.done = true;
+    } catch (err) {
+      job.error = (err && err.message) || "Upload failed";
+    }
+    renderMachineUploads();
+  };
+  const pending = [...jobs];
+  await Promise.all(Array.from({ length: Math.min(MACHINE_UPLOADS_AT_ONCE, pending.length) }, async () => {
+    while (pending.length) await runOne(pending.shift());
+  }));
+  const failed = jobs.filter((j) => j.error).length;
+  setStatus(failed ? `${jobs.length - failed} uploaded, ${failed} failed.` : `${jobs.length} photo${jobs.length === 1 ? "" : "s"} uploaded. Tag them below.`, failed ? "error" : "info");
+}
+
+/** The exercise a typed or picked name means: one of the choices, or (after asking) a new custom exercise. */
+async function resolveMachineExercise(text) {
+  const label = String(text || "").trim();
+  if (!label) return null;
+  const hit = machinePage.choices.get(label.toLowerCase());
+  if (hit) return { id: hit.id, name: hit.name };
+  if (!confirm(`"${label}" isn't one of your exercises. Create it as a custom exercise?`)) return null;
+  const created = await saveCustomExerciseByName(label, { addToActiveWorkout: false });
+  if (!created) return null;
+  machinePage.choices.set(label.toLowerCase(), { label, id: created.id, name: created.name || label });
+  renderMachineChoices();
+  return { id: created.id, name: created.name || label };
+}
+
+async function tagMachinePhoto(photoId, text) {
+  const exercise = await resolveMachineExercise(text);
+  if (!exercise) return false;
+  await updateDoc(doc(db, "users", currentUser.uid, "machine_photos", photoId), { status: "tagged", exerciseId: exercise.id, exerciseName: exercise.name, taggedAt: serverTimestamp() });
+  machinePage.drafts.delete(photoId);
+  return true;
+}
+
+async function deleteMachinePhoto(photoId) {
+  const photo = machinePage.photos.find((p) => p.id === photoId);
+  if (!photo || !confirm("Delete this photo?")) return;
+  try {
+    const api = await storageApi();
+    await api.deleteObject(api.ref(api.storage, photo.storagePath)).catch(() => {});
+    await deleteDoc(doc(db, "users", currentUser.uid, "machine_photos", photoId));
+  } catch (err) {
+    setStatus("Couldn't delete the photo.", "error");
+  }
+}
+
+document.getElementById("machinePhotoFiles")?.addEventListener("change", (event) => {
+  if (!machinePage || !event.target.files?.length) return;
+  const files = [...event.target.files];
+  event.target.value = "";
+  uploadMachinePhotos(files).catch((err) => setStatus(`Upload failed: ${err.message || err}`, "error"));
+});
+document.getElementById("machinePhotosPage")?.addEventListener("click", async (event) => {
+  if (!machinePage) return;
+  const save = event.target.closest("[data-photo-save]");
+  if (save) {
+    const id = save.getAttribute("data-photo-save");
+    const input = document.querySelector(`[data-photo-input="${CSS.escape(id)}"]`);
+    if (await tagMachinePhoto(id, input?.value)) setStatus("Saved.", "info");
+    return;
+  }
+  if (event.target.closest("[data-photo-save-all]")) {
+    let saved = 0;
+    for (const input of [...document.querySelectorAll("[data-photo-input]")].filter((i) => i.value.trim())) {
+      if (await tagMachinePhoto(input.getAttribute("data-photo-input"), input.value)) saved += 1;
+    }
+    setStatus(saved ? `Saved ${saved} photo${saved === 1 ? "" : "s"}.` : "Type or pick an exercise next to a photo first.", saved ? "info" : "error");
+    return;
+  }
+  const untag = event.target.closest("[data-photo-untag]");
+  if (untag) {
+    await updateDoc(doc(db, "users", currentUser.uid, "machine_photos", untag.getAttribute("data-photo-untag")), { status: "untagged", exerciseId: null, exerciseName: null });
+    return;
+  }
+  const del = event.target.closest("[data-photo-delete]");
+  if (del) await deleteMachinePhoto(del.getAttribute("data-photo-delete"));
+});
+document.getElementById("machinePhotosPage")?.addEventListener("keydown", async (event) => {
+  const input = event.target.closest && event.target.closest("[data-photo-input]");
+  if (!input || event.key !== "Enter") return;
+  event.preventDefault();
+  if (await tagMachinePhoto(input.getAttribute("data-photo-input"), input.value)) setStatus("Saved.", "info");
+});
+
+function renderMachinePhotosSignedOut() {
+  const box = document.getElementById("machinePhotosPage");
+  if (box) box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Log in to see your machine photos.</div>`;
+}
+
+// ---- exercise-links.html: check or change each of your exercises' ExerciseDB match ----
+// Claude's first guess is already saved for every exercise (matchedBy "match", "close" or "none"); here you
+// confirm it ("Looks right"), pick another ExerciseDB exercise, or say there is no match. A change only
+// touches the link: the exercise's id, name, history and records stay as they are.
+let linksPage = null;
+const LINK_STATUS = {
+  you: { label: "Checked", cls: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300", order: 3 },
+  match: { label: "My guess", cls: "border-zinc-700 bg-zinc-800/60 text-zinc-300", order: 2 },
+  close: { label: "Closest - check", cls: "border-amber-400/30 bg-amber-400/10 text-amber-300", order: 0 },
+  none: { label: "No match found", cls: "border-zinc-700 bg-zinc-800/60 text-zinc-400", order: 1 },
+  unlinked: { label: "Not linked yet", cls: "border-zinc-700 bg-zinc-800/60 text-zinc-400", order: 1 },
+};
+
+/** The animation for an ExerciseDB id (exdb_XXXX), on ExerciseDB's own server. */
+const exdbGifUrl = (exdbId) => `https://static.exercisedb.dev/media/${encodeURIComponent(String(exdbId || "").replace(/^exdb_/, ""))}.gif`;
+
+async function loadExerciseLinksPage() {
+  const box = document.getElementById("exerciseLinksPage");
+  if (!box || !currentUser) return;
+  try {
+    const [snap, customSnap, exdb] = await Promise.all([
+      getDocs(collection(db, "users", currentUser.uid, "exercise_links")),
+      getDocs(query(collection(db, "users", currentUser.uid, "custom_exercises"), limit(CUSTOM_EXERCISE_CAP))),
+      loadExdbIndex(),
+    ]);
+    const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    // Custom exercises made since the first linking, not linked yet.
+    customSnap.forEach((d) => {
+      if (!rows.some((r) => r.id === d.id)) rows.push({ id: d.id, name: d.data().name, exdbId: null, exdbName: null, matchedBy: "unlinked", sessions: 0 });
+    });
+    const opened = location.hash.match(/^#ex=(.+)$/);
+    linksPage = { rows, exdb, filter: "all", search: "", openRow: opened ? decodeURIComponent(opened[1]) : null, query: "" };
+    renderExerciseLinksPage();
+    if (linksPage.openRow) document.querySelector(`[data-link-row="${CSS.escape(linksPage.openRow)}"]`)?.scrollIntoView({ block: "center" });
+  } catch (err) {
+    box.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your exercises: ${escapeHtml(err.message || err)}</div>`;
+  }
+}
+
+function linkSuggestions(text) {
+  const expanded = expandQueryWithAliases(normalizeSearchText(text));
+  if (!expanded) return [];
+  return linksPage.exdb
+    .map((ex) => ({ ex, score: scoreExerciseAgainstQuery(expanded, ex.name, [...(ex.equipment || []), ...(ex.target || []), ...(ex.bodyParts || [])]) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map((x) => x.ex);
+}
+
+function linkRowHtml(row) {
+  const status = LINK_STATUS[row.matchedBy] || LINK_STATUS.match;
+  const open = linksPage.openRow === row.id;
+  const thumb = row.exdbId
+    ? `<img src="${escapeHtml(exdbGifUrl(row.exdbId))}" alt="" loading="lazy" class="h-20 w-20 shrink-0 rounded-xl bg-white object-contain">`
+    : `<div class="flex h-20 w-20 shrink-0 items-center justify-center rounded-xl border border-dashed border-zinc-700 text-center text-[11px] text-zinc-500">No match</div>`;
+  const picker = open ? (() => {
+    const q = linksPage.query || row.name;
+    // The current match stays first, so it is easy to keep.
+    const current = row.exdbId && !linksPage.query ? linksPage.exdb.find((e) => e.id === row.exdbId) : null;
+    const hits = [current, ...linkSuggestions(q).filter((e) => !current || e.id !== current.id)].filter(Boolean).slice(0, 8);
+    return `<div class="mt-3 rounded-xl border border-zinc-700 bg-zinc-950 p-3">
+      <input data-link-query="${escapeHtml(row.id)}" value="${escapeHtml(q)}" placeholder="Search ExerciseDB" class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none">
+      <div class="mt-2 space-y-1">${hits.length ? hits.map((ex) => `
+        <button type="button" data-link-pick="${escapeHtml(row.id)}" data-exdb="${escapeHtml(ex.id)}" class="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left hover:bg-zinc-800 ${ex.id === row.exdbId ? "bg-emerald-500/10" : ""}">
+          <img src="${escapeHtml(exdbGifUrl(ex.id))}" alt="" loading="lazy" class="h-12 w-12 shrink-0 rounded-md bg-white object-contain">
+          <span class="min-w-0"><span class="block text-sm font-semibold text-zinc-100">${escapeHtml(ex.name)}</span><span class="block text-xs text-zinc-500">${escapeHtml([...(ex.equipment || []), ...(ex.target || [])].map(titleCase).join(" · "))}</span></span>
+        </button>`).join("") : `<div class="px-2 py-2 text-sm text-zinc-500">Nothing found. Try other words, e.g. "machine row".</div>`}</div>
+      <div class="mt-2 flex flex-wrap gap-3 text-sm"><button type="button" data-link-none="${escapeHtml(row.id)}" class="text-zinc-400 hover:text-white">No match in ExerciseDB</button><button type="button" data-link-close-picker class="text-zinc-500 hover:text-white">Cancel</button></div>
+    </div>`;
+  })() : "";
+  return `
+    <div data-link-row="${escapeHtml(row.id)}" class="rounded-2xl border ${open ? "border-emerald-500/40" : "border-zinc-800"} bg-zinc-900/60 p-3">
+      <div class="flex gap-3">
+        ${thumb}
+        <div class="min-w-0 flex-1">
+          <div class="font-semibold leading-snug text-zinc-100">${escapeHtml(row.name)} <span class="text-xs font-normal text-zinc-500">· ${Number(row.sessions) || 0} session${Number(row.sessions) === 1 ? "" : "s"}</span></div>
+          <div class="mt-0.5 text-sm text-zinc-300"><i class="fa-solid fa-arrow-right mr-1.5 text-[10px] text-zinc-600"></i>${row.exdbId ? escapeHtml(titleCase(row.exdbName || "")) : `<span class="text-zinc-500">No match</span>`}</div>
+          <div class="mt-2 flex flex-wrap items-center gap-2">
+            <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold ${status.cls}">${status.label}</span>
+            ${row.matchedBy !== "you" ? `<button type="button" data-link-ok="${escapeHtml(row.id)}" class="rounded-lg border border-emerald-500/40 px-2.5 py-1 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/10">Looks right</button>` : ""}
+            <button type="button" data-link-change="${escapeHtml(row.id)}" class="rounded-lg border border-zinc-700 px-2.5 py-1 text-xs font-semibold text-zinc-200 hover:border-zinc-500">${open ? "Close" : "Change"}</button>
+            ${row.exdbId ? `<button type="button" class="text-xs text-zinc-500 hover:text-zinc-300" data-exercise-card="${escapeHtml(row.id)}" data-exercise-name="${escapeHtml(row.name)}">Steps</button>` : ""}
+          </div>
+        </div>
+      </div>
+      ${picker}
+    </div>`;
+}
+
+function renderExerciseLinksPage() {
+  const box = document.getElementById("exerciseLinksPage");
+  if (!box || !linksPage) return;
+  const typing = document.activeElement && document.activeElement.matches && document.activeElement.matches("[data-link-query], #linksSearch");
+  const focusKey = typing ? (document.activeElement.getAttribute("data-link-query") || "linksSearch") : null;
+  const caret = typing ? document.activeElement.selectionStart : null;
+  const toCheck = (r) => ["close", "none", "unlinked"].includes(r.matchedBy);
+  const counts = { all: linksPage.rows.length, check: linksPage.rows.filter(toCheck).length, you: linksPage.rows.filter((r) => r.matchedBy === "you").length };
+  const term = linksPage.search.trim().toLowerCase();
+  const rows = linksPage.rows
+    .filter((r) => (linksPage.filter === "check" ? toCheck(r) : linksPage.filter === "you" ? r.matchedBy === "you" : true))
+    .filter((r) => !term || r.name.toLowerCase().includes(term) || String(r.exdbName || "").toLowerCase().includes(term))
+    .sort((a, b) => (LINK_STATUS[a.matchedBy]?.order ?? 2) - (LINK_STATUS[b.matchedBy]?.order ?? 2) || (Number(b.sessions) || 0) - (Number(a.sessions) || 0) || a.name.localeCompare(b.name));
+  const chip = (key, label) => `<button type="button" data-links-filter="${key}" class="rounded-full border px-3 py-1.5 text-xs font-semibold ${linksPage.filter === key ? "border-emerald-500 bg-emerald-500/15 text-emerald-300" : "border-zinc-700 text-zinc-400 hover:text-zinc-200"}">${label} <span class="opacity-60">${counts[key]}</span></button>`;
+  box.innerHTML = `
+    <div class="mb-4 flex flex-wrap items-center gap-2">
+      ${chip("all", "All")}${chip("check", "To check")}${chip("you", "Checked")}
+      <input id="linksSearch" type="search" value="${escapeHtml(linksPage.search)}" placeholder="Find an exercise" class="ml-auto w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none sm:w-56">
+    </div>
+    <div class="space-y-2">${rows.map(linkRowHtml).join("") || `<div class="rounded-xl border border-dashed border-zinc-800 px-4 py-6 text-center text-sm text-zinc-500">Nothing here.</div>`}</div>
+    <p class="mt-4 text-xs text-zinc-600">Exercise animations and instructions: ExerciseDB (exercisedb.dev).</p>`;
+  if (focusKey) {
+    const el = focusKey === "linksSearch" ? document.getElementById("linksSearch") : document.querySelector(`[data-link-query="${CSS.escape(focusKey)}"]`);
+    if (el) { el.focus(); if (caret != null) el.setSelectionRange(caret, caret); }
+  }
+}
+
+async function saveExerciseLink(rowId, exdbId) {
+  const row = linksPage.rows.find((r) => r.id === rowId);
+  if (!row) return;
+  const ex = exdbId ? linksPage.exdb.find((e) => e.id === exdbId) : null;
+  const next = { name: row.name, exdbId: ex ? ex.id : null, exdbName: ex ? ex.name.toLowerCase() : null, matchedBy: "you", sessions: Number(row.sessions) || 0, updatedAt: serverTimestamp() };
+  try {
+    await setDoc(doc(db, "users", currentUser.uid, "exercise_links", rowId), next);
+    Object.assign(row, next);
+    exerciseLinksPromise = null; // search and the exercise card pick up the new link
+    if (linksPage.openRow === rowId) {
+      // Close this row's picker - but not one you have opened on another row meanwhile.
+      linksPage.openRow = null;
+      linksPage.query = "";
+    }
+    renderExerciseLinksPage();
+    setStatus(ex ? `${row.name} → ${ex.name}` : `${row.name}: no match`, "info");
+  } catch (err) {
+    setStatus(`Couldn't save: ${err.message || err}`, "error");
+  }
+}
+
+document.getElementById("exerciseLinksPage")?.addEventListener("click", (event) => {
+  if (!linksPage) return;
+  const t = event.target.closest("[data-links-filter],[data-link-ok],[data-link-change],[data-link-pick],[data-link-none],[data-link-close-picker]");
+  if (!t) return;
+  if (t.hasAttribute("data-links-filter")) { linksPage.filter = t.getAttribute("data-links-filter"); renderExerciseLinksPage(); return; }
+  if (t.hasAttribute("data-link-ok")) { const row = linksPage.rows.find((r) => r.id === t.getAttribute("data-link-ok")); if (row) saveExerciseLink(row.id, row.exdbId); return; }
+  if (t.hasAttribute("data-link-change")) {
+    const id = t.getAttribute("data-link-change");
+    linksPage.openRow = linksPage.openRow === id ? null : id;
+    linksPage.query = "";
+    renderExerciseLinksPage();
+    return;
+  }
+  if (t.hasAttribute("data-link-pick")) { saveExerciseLink(t.getAttribute("data-link-pick"), t.getAttribute("data-exdb")); return; }
+  if (t.hasAttribute("data-link-none")) { saveExerciseLink(t.getAttribute("data-link-none"), null); return; }
+  if (t.hasAttribute("data-link-close-picker")) { linksPage.openRow = null; linksPage.query = ""; renderExerciseLinksPage(); }
+});
+document.getElementById("exerciseLinksPage")?.addEventListener("input", (event) => {
+  if (!linksPage) return;
+  if (event.target.id === "linksSearch") { linksPage.search = event.target.value; renderExerciseLinksPage(); return; }
+  if (event.target.hasAttribute("data-link-query")) {
+    linksPage.query = event.target.value;
+    const id = event.target.getAttribute("data-link-query");
+    const row = linksPage.rows.find((r) => r.id === id);
+    const el = document.querySelector(`[data-link-row="${CSS.escape(id)}"]`);
+    if (!row || !el) return;
+    const caret = event.target.selectionStart;
+    el.outerHTML = linkRowHtml(row);
+    const input = document.querySelector(`[data-link-query="${CSS.escape(id)}"]`);
+    if (input) { input.focus(); input.setSelectionRange(caret, caret); }
+  }
+});
+
+function renderExerciseLinksSignedOut() {
+  const box = document.getElementById("exerciseLinksPage");
+  if (box) box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Log in to link your exercises.</div>`;
+}
 
 els.mobileMenuBtn?.addEventListener("click", () => {
   if (!els.mobileNavPanel) return;

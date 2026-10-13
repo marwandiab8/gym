@@ -29,6 +29,28 @@ service cloud.firestore {
       return unit == "lb" || unit == "kg";
     }
 
+    function validMachinePhoto(data) {
+      return data.keys().hasOnly(["url", "storagePath", "status", "exerciseId", "exerciseName", "createdAt", "taggedAt", "width", "height", "originalName"])
+        && isNonEmptyString(data.url, 2000)
+        && isNonEmptyString(data.storagePath, 300)
+        && data.storagePath.matches("users/" + request.auth.uid + "/machine-photos/.*")
+        && (data.status == "untagged" || data.status == "tagged")
+        && isOptionalString(data.exerciseId, 120)
+        && isOptionalString(data.exerciseName, 120)
+        && (data.status == "untagged" || isNonEmptyString(data.exerciseId, 120))
+        && isOptionalString(data.get("originalName", null), 200);
+    }
+
+    // matchedBy: "match" / "close" / "none" for Claude's first guess, "you" once you have checked or changed it.
+    function validExerciseLink(data) {
+      return data.keys().hasOnly(["name", "exdbId", "exdbName", "matchedBy", "sessions", "updatedAt"])
+        && isNonEmptyString(data.name, 120)
+        && isOptionalString(data.exdbId, 40)
+        && isOptionalString(data.exdbName, 120)
+        && isOptionalString(data.get("matchedBy", null), 20)
+        && isOptionalInt(data.get("sessions", null));
+    }
+
     function validUserDocCreate(data) {
       return data.keys().hasOnly(["lastSeen", "favoriteExerciseIds"]) &&
         (!data.keys().hasAny(["favoriteExerciseIds"]) || isStringList(data.favoriteExerciseIds, 200));
@@ -154,6 +176,28 @@ service cloud.firestore {
         allow read: if isOwner(userId);
         allow write: if false;
       }
+
+      // Machine photos (machines.html): a photo uploaded to Storage, untagged until you say which
+      // exercise's machine it is. The app writes the doc only after the upload has finished.
+      match /machine_photos/{photoId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validMachinePhoto(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      // Each exercise you have used, linked to its match in the ExerciseDB catalog (or exdbId null when
+      // there is no clean match). Workout history keeps pointing at the original exercise id.
+      match /exercise_links/{exerciseId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && validExerciseLink(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // ExerciseDB (free V1, non-commercial use with credit): names, muscles, equipment, steps and the
+    // animation's URL. Loaded by an admin script; read-only for the app.
+    match /exercisedb/{exerciseId} {
+      allow read: if isSignedIn();
     }
 
     match /catalog_exercises/{document=**} {
