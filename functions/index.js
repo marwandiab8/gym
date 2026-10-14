@@ -26,12 +26,11 @@ const crypto = require("crypto");
 const { Timestamp } = require("firebase-admin/firestore");
 const { bucketByMinute, daysBetween, exerciseHeartRates, heartRateSamples, summarizeWorkout } = require("./lib/heartRate");
 const {
-  COACH_SYSTEM_PROMPT,
   QUESTION_MAX_LENGTH,
+  askCoach,
   buildRecentAnalysisFacts,
   buildWorkoutAnalysisFacts,
   coachUserMessage,
-  normalizeCoachReport,
   toMs,
 } = require("./lib/coachAnalysis");
 
@@ -48,8 +47,10 @@ const AI_PROMPT_MAX_LENGTH = 600;
 const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_MAX_REQUESTS_PER_WINDOW = 12;
 const AI_COOLDOWN_MS = 30 * 1000;
-// AI coach (analyzeWorkout): a stronger model than the routine generator, since it reads a whole session of numbers.
-const COACH_MODEL = "gpt-4.1";
+// AI coach (analyzeWorkout): GPT-6.1 Sol (a reasoning model, through the Responses API), with the previous coach model
+// as a fallback so an analysis still comes back if OpenAI refuses the GPT-6 request.
+const COACH_MODEL = "gpt-6.1-sol";
+const COACH_FALLBACK_MODEL = "gpt-4.1";
 const COACH_MAX_REQUESTS_PER_WINDOW = 10;
 const COACH_WORKOUTS_LIMIT = 150; // finished workouts read for history and the last 4 weeks
 const COACH_HEART_RATE_LIMIT = 40; // the most recent workouts whose heart rate is read
@@ -1090,7 +1091,7 @@ exports.generateAiRoutine = functions
 exports.analyzeWorkout = functions
   .runWith({
     secrets: ["OPENAI_API_KEY"],
-    timeoutSeconds: 120,
+    timeoutSeconds: 300,
     memory: "512MB",
   })
   .region(AI_REGION)
@@ -1158,41 +1159,17 @@ exports.analyzeWorkout = functions
     console.log("Coach analysis requested", { uid, scope, workoutId: target?.id || null, questionLength: question.length });
 
     try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: COACH_MODEL,
-          temperature: 0.4,
-          max_tokens: 2200,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: COACH_SYSTEM_PROMPT },
-            { role: "user", content: coachUserMessage(facts, question) },
-          ],
-        }),
+      const answer = await askCoach({
+        apiKey,
+        user: coachUserMessage(facts, question),
+        primary: COACH_MODEL,
+        fallback: COACH_FALLBACK_MODEL,
+        log: { error: (message, meta) => console.error(message, { uid, ...meta }) },
       });
-
-      if (!response.ok) {
-        const errorBody = await response.text();
-        console.error("OpenAI API failed (coach)", {
-          uid,
-          status: response.status,
-          statusText: response.statusText,
-          bodyPreview: errorBody.slice(0, 160),
-        });
-        return { ok: false, error: "The coach couldn't be reached. Please try again." };
+      if (!answer) {
+        return { ok: false, error: "The coach couldn't answer right now. Please try again." };
       }
-
-      const apiData = await response.json();
-      const report = normalizeCoachReport(apiData?.choices?.[0]?.message?.content || "");
-      if (!report) {
-        console.error("Coach reply was not a usable report", { uid, finishReason: apiData?.choices?.[0]?.finish_reason || null });
-        return { ok: false, error: "The coach's answer came back incomplete. Please try again." };
-      }
+      const report = answer.report;
 
       const saved = {
         scope,
@@ -1202,12 +1179,12 @@ exports.analyzeWorkout = functions
         period: scope === "recent" ? facts.period : null,
         question,
         report,
-        model: COACH_MODEL,
+        model: answer.model,
         createdAtMs: Date.now(),
       };
       const ref = db.collection(`users/${uid}/coachReports`).doc();
       await ref.set(saved);
-      console.warn("Coach analysis succeeded", { svc: "analyzeWorkout", kind: "success", uid, scope, reportId: ref.id });
+      console.warn("Coach analysis succeeded", { svc: "analyzeWorkout", kind: "success", uid, scope, model: answer.model, reportId: ref.id });
       return { ok: true, id: ref.id, ...saved };
     } catch (error) {
       if (error instanceof functions.https.HttpsError) throw error;

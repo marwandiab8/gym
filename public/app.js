@@ -4402,7 +4402,7 @@ function renderCoachPage() {
       <label class="mb-4 block"><span class="mb-1 block text-xs font-bold uppercase text-zinc-500">Anything specific? <span class="font-normal normal-case text-zinc-600">(optional)</span></span><textarea id="coachQuestion" rows="2" maxlength="500" class="w-full resize-none rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-3 text-white placeholder-zinc-600 focus:border-emerald-500 focus:outline-none" placeholder="e.g. Is my rest too long? Why is my bench stuck?" ${st.busy ? "disabled" : ""}>${escapeHtml(st.question)}</textarea></label>
       ${st.error ? `<div class="mb-4 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200" role="alert">${escapeHtml(st.error)}</div>` : ""}
       <button type="button" id="coachAnalyzeBtn" class="w-full rounded-xl bg-emerald-600 py-3 text-lg font-bold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60" ${st.busy || !canRun ? "disabled" : ""}>${st.busy ? `<i class="fa-solid fa-spinner fa-spin mr-2"></i>The coach is reviewing…` : `<i class="fa-solid fa-person-chalkboard mr-2"></i>Analyze`}</button>
-      ${st.busy ? `<p class="mt-2 text-center text-xs text-zinc-500">This usually takes 15–30 seconds.</p>` : ""}
+      ${st.busy ? `<p class="mt-2 text-center text-xs text-zinc-500">The coach thinks it through first: this can take up to a minute.</p>` : ""}
     </section>
     <div id="coachReport" class="mt-6 scroll-mt-24">${shown ? renderCoachReport(shown) : `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Your coach's analysis will appear here.</div>`}</div>
     ${st.reports.length > 1 ? `<section class="mt-8"><h2 class="mb-2 text-lg font-bold text-zinc-100">Past analyses</h2><div class="space-y-2">${st.reports.map((r) => `<button type="button" data-coach-report="${escapeHtml(r.id)}" class="w-full rounded-xl border ${r.id === st.shownId ? "border-emerald-500/50 bg-emerald-500/5" : "border-zinc-800 bg-zinc-900/60 hover:border-zinc-600"} px-4 py-3 text-left transition"><div class="text-xs text-zinc-500">${escapeHtml(r.createdAtMs ? new Date(r.createdAtMs).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "")} · ${escapeHtml(coachScopeLabel(r))}</div><div class="truncate text-sm font-semibold text-zinc-200">${escapeHtml(r.report?.headline || "Analysis")}</div></button>`).join("")}</div></section>` : ""}`;
@@ -4418,7 +4418,7 @@ async function runCoachAnalysis() {
   try {
     const payload = { scope: st.scope, question: st.question.trim() };
     if (st.scope === "workout" && st.workoutId) payload.workoutId = st.workoutId;
-    const { data } = await httpsCallable(functions, "analyzeWorkout", { timeout: 130000 })(payload);
+    const { data } = await httpsCallable(functions, "analyzeWorkout", { timeout: 310000 })(payload);
     if (!data?.ok) {
       st.error = data?.error || "The coach couldn't analyze that. Please try again.";
     } else {

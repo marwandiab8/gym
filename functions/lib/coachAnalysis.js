@@ -314,17 +314,58 @@ function coachUserMessage(facts, question) {
 const text = (value, max) => String(value ?? "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, max);
 const textList = (value, maxItems, maxLen) => (Array.isArray(value) ? value : []).map((v) => text(v, maxLen)).filter(Boolean).slice(0, maxItems);
 
-/** The model's reply, checked and trimmed; null when it isn't a usable report. */
-function normalizeCoachReport(raw) {
-  let data = raw;
-  if (typeof raw === "string") {
-    const body = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "");
-    try {
-      data = JSON.parse(body);
-    } catch (_) {
-      return null;
+/**
+ * The OpenAI Responses API request for a GPT-6 model (a reasoning model: no temperature; max_output_tokens covers
+ * its reasoning as well as the reply, and OpenAI suggests leaving 25,000 for both).
+ */
+function responsesRequest({ model, system, user, effort = "medium", maxOutputTokens = 25000 }) {
+  return {
+    model,
+    input: [
+      { role: "developer", content: system },
+      { role: "user", content: user },
+    ],
+    reasoning: { effort },
+    max_output_tokens: maxOutputTokens,
+  };
+}
+
+/**
+ * The reply text of a Responses API answer: the output_text parts of its message items. { text, status,
+ * incompleteReason }; an answer cut short (status "incomplete") may have no text at all.
+ */
+function responsesOutputText(apiData) {
+  const parts = [];
+  for (const item of Array.isArray(apiData && apiData.output) ? apiData.output : []) {
+    if (!item || item.type !== "message") continue;
+    for (const c of Array.isArray(item.content) ? item.content : []) {
+      if (c && c.type === "output_text" && typeof c.text === "string") parts.push(c.text);
     }
   }
+  return {
+    text: parts.join("").trim(),
+    status: String((apiData && apiData.status) || ""),
+    incompleteReason: (apiData && apiData.incomplete_details && apiData.incomplete_details.reason) || null,
+  };
+}
+
+/** A JSON object in a reply: the whole reply, or the part from its first "{" to its last "}" (fences, a stray line). */
+function parseJsonObject(raw) {
+  const body = String(raw).trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/, "").trim();
+  for (const candidate of [body, body.slice(body.indexOf("{"), body.lastIndexOf("}") + 1)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch (_) {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+/** The model's reply, checked and trimmed; null when it isn't a usable report. */
+function normalizeCoachReport(raw) {
+  const data = typeof raw === "string" ? parseJsonObject(raw) : raw;
   if (!data || typeof data !== "object") return null;
   const rating = Math.round(Number(data.rating));
   const report = {
@@ -350,15 +391,77 @@ function normalizeCoachReport(raw) {
   return report;
 }
 
+/**
+ * Asks the coach: `primary` (a GPT-6 model) through the Responses API; if OpenAI refuses that request or its answer
+ * can't be used, `fallback` through Chat Completions (the coach's first model). { report, model } with the model that
+ * answered, or null when neither could.
+ */
+async function askCoach({ apiKey, user, primary, fallback, fetchImpl = fetch, log = console }) {
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+  try {
+    const response = await fetchImpl("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(responsesRequest({ model: primary, system: COACH_SYSTEM_PROMPT, user })),
+    });
+    if (response.ok) {
+      const apiData = await response.json();
+      const out = responsesOutputText(apiData);
+      const report = normalizeCoachReport(out.text);
+      if (report) return { report, model: primary };
+      log.error("Coach answer not usable; asking the fallback model", {
+        model: primary,
+        status: out.status,
+        incompleteReason: out.incompleteReason,
+        textLength: out.text.length,
+        reasoningTokens: (apiData && apiData.usage && apiData.usage.output_tokens_details && apiData.usage.output_tokens_details.reasoning_tokens) ?? null,
+      });
+    } else {
+      const errorBody = await response.text();
+      log.error("OpenAI Responses API failed (coach); asking the fallback model", { model: primary, status: response.status, bodyPreview: errorBody.slice(0, 300) });
+    }
+  } catch (error) {
+    log.error("OpenAI Responses API request failed (coach); asking the fallback model", { model: primary, message: (error && error.message) || String(error) });
+  }
+
+  const response = await fetchImpl("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: fallback,
+      temperature: 0.4,
+      max_tokens: 2200,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: COACH_SYSTEM_PROMPT },
+        { role: "user", content: user },
+      ],
+    }),
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    log.error("OpenAI API failed (coach fallback)", { model: fallback, status: response.status, bodyPreview: errorBody.slice(0, 160) });
+    return null;
+  }
+  const apiData = await response.json();
+  const choice = apiData && Array.isArray(apiData.choices) ? apiData.choices[0] : null;
+  const report = normalizeCoachReport((choice && choice.message && choice.message.content) || "");
+  if (!report) log.error("Coach fallback reply was not a usable report", { model: fallback, finishReason: (choice && choice.finish_reason) || null });
+  return report ? { report, model: fallback } : null;
+}
+
 module.exports = {
   COACH_SYSTEM_PROMPT,
   QUESTION_MAX_LENGTH,
   RECENT_DAYS,
+  askCoach,
   buildRecentAnalysisFacts,
   buildWorkoutAnalysisFacts,
   coachUserMessage,
   estimateOneRepMax,
   normalizeCoachReport,
+  responsesOutputText,
+  responsesRequest,
   toMs,
   workoutFacts,
 };

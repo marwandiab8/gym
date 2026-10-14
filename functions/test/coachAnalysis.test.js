@@ -3,11 +3,14 @@ const assert = require("node:assert/strict");
 
 const {
   COACH_SYSTEM_PROMPT,
+  askCoach,
   buildRecentAnalysisFacts,
   buildWorkoutAnalysisFacts,
   coachUserMessage,
   estimateOneRepMax,
   normalizeCoachReport,
+  responsesOutputText,
+  responsesRequest,
   workoutFacts,
 } = require("../lib/coachAnalysis");
 
@@ -153,4 +156,98 @@ test("the estimated 1-rep max is the same as the app's", async () => {
   for (const [w, r] of [[185, 8], [205, 1], [100, 30], [0, 10], [50, 0]]) {
     assert.equal(estimateOneRepMax(w, r), app.estimateOneRepMax(w, r), `${w}x${r}`);
   }
+});
+
+const REPORT = {
+  headline: "Good session.",
+  rating: 8,
+  summary: "Solid.",
+  strengths: ["a"],
+  critique: [{ area: "b", detail: "c" }],
+  heartRate: "d",
+  pacing: "e",
+  recovery: "f",
+  recommendations: [{ title: "g", detail: "h" }],
+  nextSession: "i",
+};
+const responsesAnswer = (text, extra = {}) => ({
+  status: "completed",
+  output: [
+    { type: "reasoning", id: "rs_1", summary: [] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text }] },
+  ],
+  usage: { output_tokens_details: { reasoning_tokens: 900 } },
+  ...extra,
+});
+const chatAnswer = (content) => ({ choices: [{ message: { content }, finish_reason: "stop" }] });
+
+function fakeOpenAI(replies) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization });
+    const r = replies.shift();
+    if (r instanceof Error) throw r;
+    return { ok: r.status < 400, status: r.status, json: async () => r.body, text: async () => JSON.stringify(r.body) };
+  };
+  const errors = [];
+  return { calls, errors, fetchImpl, log: { error: (message, meta) => errors.push({ message, meta }) } };
+}
+const ask = (o) => askCoach({ apiKey: "sk-test", user: "data", primary: "gpt-6.1-sol", fallback: "gpt-4.1", fetchImpl: o.fetchImpl, log: o.log });
+
+test("GPT-6 is asked through the Responses API, as a reasoning model", () => {
+  const body = responsesRequest({ model: "gpt-6.1-sol", system: "be a coach", user: "data" });
+  assert.deepEqual(body, {
+    model: "gpt-6.1-sol",
+    input: [{ role: "developer", content: "be a coach" }, { role: "user", content: "data" }],
+    reasoning: { effort: "medium" },
+    max_output_tokens: 25000,
+  });
+  assert.equal("temperature" in body, false, "reasoning models take no temperature");
+});
+
+test("the reply text is read from the answer's message items, and a cut-short answer is noticed", () => {
+  assert.deepEqual(responsesOutputText(responsesAnswer("{\"a\":1}")), { text: "{\"a\":1}", status: "completed", incompleteReason: null });
+  const twoParts = { status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "{\"a\":" }, { type: "output_text", text: "1}" }] }] };
+  assert.equal(responsesOutputText(twoParts).text, "{\"a\":1}");
+  assert.deepEqual(
+    responsesOutputText({ status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [{ type: "reasoning" }] }),
+    { text: "", status: "incomplete", incompleteReason: "max_output_tokens" },
+  );
+  assert.equal(normalizeCoachReport("Here is my analysis:\n" + JSON.stringify(REPORT) + "\nKeep it up!").headline, "Good session.", "stray words around the JSON");
+});
+
+test("the coach answers with GPT-6.1 Sol", async () => {
+  const o = fakeOpenAI([{ status: 200, body: responsesAnswer(JSON.stringify(REPORT)) }]);
+  const answer = await ask(o);
+  assert.equal(answer.model, "gpt-6.1-sol");
+  assert.equal(answer.report.headline, "Good session.");
+  assert.equal(o.calls.length, 1);
+  assert.equal(o.calls[0].url, "https://api.openai.com/v1/responses");
+  assert.equal(o.calls[0].auth, "Bearer sk-test");
+  assert.equal(o.calls[0].body.model, "gpt-6.1-sol");
+});
+
+test("if OpenAI refuses the GPT-6 request, gpt-4.1 answers instead", async () => {
+  const o = fakeOpenAI([{ status: 400, body: { error: { message: "Unsupported parameter" } } }, { status: 200, body: chatAnswer(JSON.stringify(REPORT)) }]);
+  const answer = await ask(o);
+  assert.equal(answer.model, "gpt-4.1");
+  assert.equal(o.calls[1].url, "https://api.openai.com/v1/chat/completions");
+  assert.equal(o.calls[1].body.model, "gpt-4.1");
+  assert.match(o.errors[0].message, /Responses API failed/);
+  assert.equal(o.errors[0].meta.status, 400);
+});
+
+test("a GPT-6 answer cut short, or a network error, also falls back", async () => {
+  const cut = fakeOpenAI([{ status: 200, body: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [] } }, { status: 200, body: chatAnswer(JSON.stringify(REPORT)) }]);
+  assert.equal((await ask(cut)).model, "gpt-4.1");
+  assert.equal(cut.errors[0].meta.incompleteReason, "max_output_tokens");
+  const offline = fakeOpenAI([new Error("ECONNRESET"), { status: 200, body: chatAnswer(JSON.stringify(REPORT)) }]);
+  assert.equal((await ask(offline)).model, "gpt-4.1");
+});
+
+test("when neither model can answer, there is no report", async () => {
+  const o = fakeOpenAI([{ status: 500, body: {} }, { status: 500, body: {} }]);
+  assert.equal(await ask(o), null);
+  const junk = fakeOpenAI([{ status: 200, body: responsesAnswer("no json here") }, { status: 200, body: chatAnswer("still no json") }]);
+  assert.equal(await ask(junk), null);
 });
