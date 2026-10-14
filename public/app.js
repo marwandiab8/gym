@@ -1193,6 +1193,7 @@ onAuthStateChanged(auth, async (user) => {
     renderRecentWorkoutsSignedOut();
     renderPrsSignedOut();
     renderProgressSignedOut();
+    renderCoachSignedOut();
     renderMachinePhotosSignedOut();
     renderExerciseLinksSignedOut();
     handleRouteChange();
@@ -1205,6 +1206,7 @@ onAuthStateChanged(auth, async (user) => {
   runBootstrapStep("prs page", async () => loadPrsPage());
   runBootstrapStep("machine photos", async () => loadMachinePhotosPage());
   runBootstrapStep("exercise links", async () => loadExerciseLinksPage());
+  runBootstrapStep("coach page", async () => loadCoachPage());
   runBootstrapStep("analytics", () => loadAnalytics());
   runBootstrapStep("templates", () => loadTemplates());
   runBootstrapStep("integrity check", () => runIntegrityCheckIfDue());
@@ -3362,6 +3364,9 @@ function showWorkoutDetailsModal(workout, displayDate) {
     const focusText = Array.isArray(workout.focus) && workout.focus.length ? workout.focus.join(", ") : "No focus selected";
     const sessionNotes = typeof workout.notes === "string" ? workout.notes.trim() : "";
     let contentHtml = `<div class="text-sm text-zinc-400 mb-6 pb-4 border-b border-zinc-800">${displayDate} <br/>Routine: <span class="font-bold text-emerald-400">${escapeHtml(workout.routineName || 'Custom Workout')}</span><br/>Focus: <span class="font-bold text-blue-300">${escapeHtml(focusText)}</span></div><div id="modalHeartRate"></div>`;
+    if (isSavedWorkout && workout.id) {
+        contentHtml += `<a href="coach.html#workout=${encodeURIComponent(workout.id)}&go=1" class="mb-6 flex items-center justify-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 py-3 text-sm font-bold text-emerald-300 transition hover:bg-emerald-500/20"><i class="fa-solid fa-person-chalkboard"></i> Ask the coach about this workout</a>`;
+    }
     if (sessionNotes) {
         contentHtml += `<div class="mb-6 rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3"><div class="mb-1 text-xs font-bold uppercase tracking-wide text-amber-300"><i class="fa-regular fa-note-sticky mr-2"></i>Session Notes</div><div class="text-sm leading-relaxed text-zinc-200 whitespace-pre-wrap">${escapeHtml(sessionNotes)}</div></div>`;
     }
@@ -4262,6 +4267,204 @@ document.getElementById("progressPage")?.addEventListener("change", (event) => {
   if (!progressState || event.target.id !== "progressExerciseSelect") return;
   progressState.exerciseId = event.target.value;
   renderProgressExerciseChart();
+});
+
+// ==================== AI COACH PAGE ====================
+// Ask the coach (functions: analyzeWorkout) about a finished workout or the last 4 weeks: it reads the sets, the heart
+// rate on each exercise, the rest and timing, and the days between workouts. Each analysis is kept in
+// users/{uid}/coachReports. coach.html#workout=ID picks that workout; the "Ask the coach" button in a workout's details
+// adds &go=1 to start right away.
+let coachState = null; // { workouts, reports, scope, workoutId, question, busy, error, shownId }
+
+function coachMs(value) {
+  if (value == null || value === "") return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value === "object" && Number.isFinite(Number(value.seconds))) return Number(value.seconds) * 1000;
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return n;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+const coachStartMs = (w) => coachMs(w?.startedAt) || coachMs(w?.date) || coachMs(w?.dateKey);
+
+function coachWorkoutLabel(w) {
+  const start = coachStartMs(w);
+  const end = coachMs(w?.finishedAt);
+  const day = start ? new Date(start).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }) : "Undated";
+  const mins = start && end > start ? ` · ${Math.round((end - start) / 60000)} min` : "";
+  return `${day} · ${w?.routineName || "Custom Workout"}${mins}`;
+}
+
+function coachScopeLabel(r) {
+  if (r?.scope === "recent") return r.period ? `Last 4 weeks · ${r.period.from} to ${r.period.to}` : "Last 4 weeks";
+  return `${r?.routineName || "Workout"}${r?.workoutDate ? ` · ${r.workoutDate}` : ""}`;
+}
+
+async function loadCoachPage() {
+  const box = document.getElementById("coachPage");
+  if (!currentUser || !box) return;
+  try {
+    const [workoutSnap, reportSnap] = await Promise.all([
+      getDocs(query(collection(db, "users", currentUser.uid, "workouts"), where("status", "==", "final"), orderBy("updatedAtMs", "desc"), limit(120))),
+      getDocs(query(collection(db, "users", currentUser.uid, "coachReports"), orderBy("createdAtMs", "desc"), limit(20))),
+    ]);
+    const workouts = workoutSnap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => coachStartMs(b) - coachStartMs(a));
+    const reports = reportSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const askedFor = hash.get("workout") || "";
+    const known = askedFor && workouts.some((w) => w.id === askedFor);
+    coachState = {
+      workouts,
+      reports,
+      scope: hash.get("scope") === "recent" ? "recent" : "workout",
+      workoutId: known ? askedFor : workouts[0]?.id || "",
+      question: "",
+      busy: false,
+      error: "",
+      shownId: reports[0]?.id || null,
+    };
+    renderCoachPage();
+    if (known && hash.get("go") === "1") {
+      // Started from a workout's details: analyze it now, and don't start again on a reload.
+      history.replaceState(null, "", `${location.pathname}#workout=${encodeURIComponent(askedFor)}`);
+      runCoachAnalysis();
+    }
+  } catch (e) {
+    console.error("Coach page load failed", e);
+    box.innerHTML = `<div class="rounded-2xl border border-red-500/30 bg-red-500/5 px-4 py-6 text-center text-sm text-red-300">Couldn't load your workouts. Check your connection and reload the page.</div>`;
+  }
+}
+
+function renderCoachSignedOut() {
+  coachState = null;
+  const box = document.getElementById("coachPage");
+  if (box) box.innerHTML = `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Log in to ask the coach.</div>`;
+}
+
+const coachParagraph = (text) => `<p class="text-sm leading-relaxed text-zinc-300 whitespace-pre-line">${escapeHtml(text)}</p>`;
+
+function coachSection(icon, color, title, body) {
+  if (!body) return "";
+  return `<section class="mt-5"><h3 class="mb-2 flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-zinc-400"><i class="fa-solid ${icon} ${color}"></i> ${title}</h3>${body}</section>`;
+}
+
+function renderCoachReport(r) {
+  const rep = r?.report || {};
+  const when = r?.createdAtMs ? new Date(r.createdAtMs).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+  const rating = Number.isFinite(Number(rep.rating)) && rep.rating != null
+    ? `<div class="shrink-0 rounded-2xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-center"><div class="text-2xl font-black text-emerald-400">${Number(rep.rating)}<span class="text-sm font-bold text-zinc-500">/10</span></div><div class="text-[10px] font-bold uppercase tracking-wide text-zinc-500">${r.scope === "recent" ? "Training" : "Session"}</div></div>`
+    : "";
+  const list = (items, icon, color) => `<ul class="space-y-2">${items.map((item) => `<li class="flex gap-2 text-sm leading-relaxed text-zinc-300"><i class="fa-solid ${icon} ${color} mt-1 shrink-0"></i><span>${item}</span></li>`).join("")}</ul>`;
+  const strengths = (rep.strengths || []).length ? list(rep.strengths.map(escapeHtml), "fa-circle-check", "text-emerald-400") : "";
+  const critique = (rep.critique || []).length
+    ? list(rep.critique.map((c) => `${c.area ? `<span class="font-semibold text-zinc-100">${escapeHtml(c.area)}:</span> ` : ""}${escapeHtml(c.detail)}`), "fa-triangle-exclamation", "text-amber-400")
+    : "";
+  const recommendations = (rep.recommendations || []).length
+    ? `<ol class="space-y-2">${rep.recommendations.map((rec, i) => `<li class="flex gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2.5"><span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-xs font-bold text-emerald-400">${i + 1}</span><div class="text-sm leading-relaxed">${rec.title ? `<div class="font-semibold text-zinc-100">${escapeHtml(rec.title)}</div>` : ""}<div class="text-zinc-300">${escapeHtml(rec.detail)}</div></div></li>`).join("")}</ol>`
+    : "";
+  return `<article class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 sm:p-6">
+    <div class="flex items-start justify-between gap-3">
+      <div class="min-w-0">
+        <div class="text-xs font-bold uppercase tracking-wide text-emerald-400">${escapeHtml(coachScopeLabel(r))}</div>
+        <h2 class="mt-1 text-xl font-bold leading-snug text-white">${escapeHtml(rep.headline || "Coach's analysis")}</h2>
+        ${r.question ? `<p class="mt-2 text-sm text-zinc-400"><i class="fa-regular fa-comment mr-1"></i>You asked: “${escapeHtml(r.question)}”</p>` : ""}
+      </div>
+      ${rating}
+    </div>
+    ${rep.summary ? `<div class="mt-4">${coachParagraph(rep.summary)}</div>` : ""}
+    ${coachSection("fa-thumbs-up", "text-emerald-400", "What's working", strengths)}
+    ${coachSection("fa-wrench", "text-amber-400", "What to fix", critique)}
+    ${coachSection("fa-heart-pulse", "text-rose-400", "Heart rate &amp; effort", rep.heartRate ? coachParagraph(rep.heartRate) : "")}
+    ${coachSection("fa-stopwatch", "text-sky-400", "Rest &amp; pacing", rep.pacing ? coachParagraph(rep.pacing) : "")}
+    ${coachSection("fa-bed", "text-indigo-400", "Recovery between workouts", rep.recovery ? coachParagraph(rep.recovery) : "")}
+    ${coachSection("fa-list-check", "text-emerald-400", "Recommendations", recommendations)}
+    ${rep.nextSession ? `<section class="mt-5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3"><h3 class="mb-1 flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-emerald-300"><i class="fa-solid fa-bullseye"></i> Next session</h3>${coachParagraph(rep.nextSession)}</section>` : ""}
+    <div class="mt-5 text-xs text-zinc-600">${escapeHtml(when)}${r.model ? ` · ${escapeHtml(r.model)}` : ""}</div>
+  </article>`;
+}
+
+function renderCoachPage() {
+  const box = document.getElementById("coachPage");
+  if (!box || !coachState) return;
+  const st = coachState;
+  const scopeBtn = (scope, label) => `<button type="button" data-coach-scope="${scope}" class="flex-1 rounded-lg px-3 py-2 font-semibold ${st.scope === scope ? "bg-white/10 text-white" : "text-zinc-400 hover:text-zinc-200"}" ${st.busy ? "disabled" : ""}>${label}</button>`;
+  const picker = st.scope === "workout"
+    ? (st.workouts.length
+      ? `<label class="mb-3 block"><span class="mb-1 block text-xs font-bold uppercase text-zinc-500">Workout</span><select id="coachWorkout" class="w-full rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-3 text-white focus:border-emerald-500 focus:outline-none" ${st.busy ? "disabled" : ""}>${st.workouts.map((w) => `<option value="${escapeHtml(w.id)}" ${w.id === st.workoutId ? "selected" : ""}>${escapeHtml(coachWorkoutLabel(w))}</option>`).join("")}</select></label>`
+      : `<p class="mb-3 text-sm text-zinc-500">Finish a workout first, then ask the coach about it.</p>`)
+    : `<p class="mb-3 text-sm text-zinc-400">Every workout in the last 4 weeks: the days between them, how often you trained, and how each lift moved.</p>`;
+  const canRun = st.scope === "recent" || !!st.workoutId;
+  const shown = st.reports.find((r) => r.id === st.shownId);
+  box.innerHTML = `
+    <section class="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 sm:p-5">
+      <div role="group" aria-label="What to analyze" class="mb-4 flex rounded-xl border border-zinc-800 bg-zinc-950 p-1 text-sm">${scopeBtn("workout", "A workout")}${scopeBtn("recent", "Last 4 weeks")}</div>
+      ${picker}
+      <label class="mb-4 block"><span class="mb-1 block text-xs font-bold uppercase text-zinc-500">Anything specific? <span class="font-normal normal-case text-zinc-600">(optional)</span></span><textarea id="coachQuestion" rows="2" maxlength="500" class="w-full resize-none rounded-xl border border-zinc-700 bg-zinc-900 px-3 py-3 text-white placeholder-zinc-600 focus:border-emerald-500 focus:outline-none" placeholder="e.g. Is my rest too long? Why is my bench stuck?" ${st.busy ? "disabled" : ""}>${escapeHtml(st.question)}</textarea></label>
+      ${st.error ? `<div class="mb-4 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200" role="alert">${escapeHtml(st.error)}</div>` : ""}
+      <button type="button" id="coachAnalyzeBtn" class="w-full rounded-xl bg-emerald-600 py-3 text-lg font-bold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-60" ${st.busy || !canRun ? "disabled" : ""}>${st.busy ? `<i class="fa-solid fa-spinner fa-spin mr-2"></i>The coach is reviewing…` : `<i class="fa-solid fa-person-chalkboard mr-2"></i>Analyze`}</button>
+      ${st.busy ? `<p class="mt-2 text-center text-xs text-zinc-500">This usually takes 15–30 seconds.</p>` : ""}
+    </section>
+    <div id="coachReport" class="mt-6 scroll-mt-24">${shown ? renderCoachReport(shown) : `<div class="rounded-2xl border border-dashed border-zinc-800 px-4 py-10 text-center text-sm text-zinc-500">Your coach's analysis will appear here.</div>`}</div>
+    ${st.reports.length > 1 ? `<section class="mt-8"><h2 class="mb-2 text-lg font-bold text-zinc-100">Past analyses</h2><div class="space-y-2">${st.reports.map((r) => `<button type="button" data-coach-report="${escapeHtml(r.id)}" class="w-full rounded-xl border ${r.id === st.shownId ? "border-emerald-500/50 bg-emerald-500/5" : "border-zinc-800 bg-zinc-900/60 hover:border-zinc-600"} px-4 py-3 text-left transition"><div class="text-xs text-zinc-500">${escapeHtml(r.createdAtMs ? new Date(r.createdAtMs).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "")} · ${escapeHtml(coachScopeLabel(r))}</div><div class="truncate text-sm font-semibold text-zinc-200">${escapeHtml(r.report?.headline || "Analysis")}</div></button>`).join("")}</div></section>` : ""}`;
+}
+
+async function runCoachAnalysis() {
+  const st = coachState;
+  if (!st || st.busy || !currentUser) return;
+  st.busy = true;
+  st.error = "";
+  renderCoachPage();
+  let done = false;
+  try {
+    const payload = { scope: st.scope, question: st.question.trim() };
+    if (st.scope === "workout" && st.workoutId) payload.workoutId = st.workoutId;
+    const { data } = await httpsCallable(functions, "analyzeWorkout", { timeout: 130000 })(payload);
+    if (!data?.ok) {
+      st.error = data?.error || "The coach couldn't analyze that. Please try again.";
+    } else {
+      const { ok, ...saved } = data;
+      st.reports = [saved, ...st.reports.filter((r) => r.id !== saved.id)];
+      st.shownId = saved.id;
+      st.question = "";
+      done = true;
+    }
+  } catch (e) {
+    console.error("Coach analysis failed", e);
+    // The server's own messages (wait 20s, hourly limit, not signed in) are worth showing; "internal" isn't.
+    const fromServer = e?.code && e.code !== "functions/internal" && e.code !== "functions/unavailable" && e?.message;
+    st.error = fromServer || "Could not reach the coach. Check your connection and try again.";
+  } finally {
+    st.busy = false;
+    renderCoachPage();
+    if (done) document.getElementById("coachReport")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+document.getElementById("coachPage")?.addEventListener("click", (event) => {
+  if (!coachState) return;
+  const scopeBtn = event.target.closest("[data-coach-scope]");
+  if (scopeBtn) {
+    coachState.scope = scopeBtn.dataset.coachScope === "recent" ? "recent" : "workout";
+    coachState.error = "";
+    renderCoachPage();
+    return;
+  }
+  if (event.target.closest("#coachAnalyzeBtn")) {
+    runCoachAnalysis();
+    return;
+  }
+  const reportBtn = event.target.closest("[data-coach-report]");
+  if (reportBtn) {
+    coachState.shownId = reportBtn.dataset.coachReport;
+    renderCoachPage();
+    document.getElementById("coachReport")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+});
+document.getElementById("coachPage")?.addEventListener("change", (event) => {
+  if (coachState && event.target.id === "coachWorkout") coachState.workoutId = event.target.value;
+});
+document.getElementById("coachPage")?.addEventListener("input", (event) => {
+  if (coachState && event.target.id === "coachQuestion") coachState.question = event.target.value;
 });
 
 // ==================== EXERCISE CARD & MACHINE PHOTOS ====================

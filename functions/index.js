@@ -25,6 +25,15 @@ const {
 const crypto = require("crypto");
 const { Timestamp } = require("firebase-admin/firestore");
 const { bucketByMinute, daysBetween, exerciseHeartRates, heartRateSamples, summarizeWorkout } = require("./lib/heartRate");
+const {
+  COACH_SYSTEM_PROMPT,
+  QUESTION_MAX_LENGTH,
+  buildRecentAnalysisFacts,
+  buildWorkoutAnalysisFacts,
+  coachUserMessage,
+  normalizeCoachReport,
+  toMs,
+} = require("./lib/coachAnalysis");
 
 admin.initializeApp();
 
@@ -39,6 +48,11 @@ const AI_PROMPT_MAX_LENGTH = 600;
 const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_MAX_REQUESTS_PER_WINDOW = 12;
 const AI_COOLDOWN_MS = 30 * 1000;
+// AI coach (analyzeWorkout): a stronger model than the routine generator, since it reads a whole session of numbers.
+const COACH_MODEL = "gpt-4.1";
+const COACH_MAX_REQUESTS_PER_WINDOW = 10;
+const COACH_WORKOUTS_LIMIT = 150; // finished workouts read for history and the last 4 weeks
+const COACH_HEART_RATE_LIMIT = 40; // the most recent workouts whose heart rate is read
 const EXERCISE_LAST_SETS_LIMIT = 60;
 const WORKOUT_STATUSES = {
   DRAFT: "draft",
@@ -49,9 +63,16 @@ const MAX_WORKOUT_EXERCISES = 50;
 const MAX_EXERCISE_SETS = 25;
 const INTEGRITY_SCAN_LIMIT = 80;
 
-async function enforceAiRateLimit(uid) {
+// Routine generation and the coach each have their own hourly allowance (the routine's record keeps its old id).
+const AI_LIMITS = {
+  routine: { suffix: "", max: AI_MAX_REQUESTS_PER_WINDOW, again: "generating another routine", hourly: "Hourly AI generation limit reached. Please try again later." },
+  coach: { suffix: "_coach", max: COACH_MAX_REQUESTS_PER_WINDOW, again: "asking the coach again", hourly: `The coach can do ${COACH_MAX_REQUESTS_PER_WINDOW} analyses an hour. Please try again later.` },
+};
+
+async function enforceAiRateLimit(uid, kind = "routine") {
+  const limits = AI_LIMITS[kind] || AI_LIMITS.routine;
   const now = Date.now();
-  const rateRef = admin.firestore().collection("_ai_rate_limits").doc(uid);
+  const rateRef = admin.firestore().collection("_ai_rate_limits").doc(`${uid}${limits.suffix}`);
 
   await admin.firestore().runTransaction(async (tx) => {
     const snap = await tx.get(rateRef);
@@ -61,13 +82,13 @@ async function enforceAiRateLimit(uid) {
 
     if ((Number(state.lastRequestAtMs) || 0) + AI_COOLDOWN_MS > now) {
       const retryAfterSec = Math.ceil((((Number(state.lastRequestAtMs) || 0) + AI_COOLDOWN_MS) - now) / 1000);
-      throw new functions.https.HttpsError("resource-exhausted", `Please wait ${retryAfterSec}s before generating another routine.`);
+      throw new functions.https.HttpsError("resource-exhausted", `Please wait ${retryAfterSec}s before ${limits.again}.`);
     }
 
     const withinWindow = (Number(state.windowStartedAtMs) || 0) + AI_RATE_WINDOW_MS > now;
     const requestCount = withinWindow ? Number(state.requestCount || 0) : 0;
-    if (requestCount >= AI_MAX_REQUESTS_PER_WINDOW) {
-      throw new functions.https.HttpsError("resource-exhausted", "Hourly AI generation limit reached. Please try again later.");
+    if (requestCount >= limits.max) {
+      throw new functions.https.HttpsError("resource-exhausted", limits.hourly);
     }
 
     tx.set(rateRef, {
@@ -1058,6 +1079,140 @@ exports.generateAiRoutine = functions
         exercises: [],
         error: "Could not generate a routine right now. Please try again in a moment.",
       };
+    }
+  });
+
+// ---------------------------------------------------------------- AI coach
+// Analyzes a finished workout (or the last 4 weeks) as an expert coach: sets against last time, heart rate per
+// exercise, rest and timing, and the days between workouts (lib/coachAnalysis.js works out the facts; the model
+// interprets them). Each analysis is kept in users/{uid}/coachReports so it can be read again.
+// Request: { scope: "workout" | "recent", workoutId?: string (default: the latest workout), question?: string }.
+exports.analyzeWorkout = functions
+  .runWith({
+    secrets: ["OPENAI_API_KEY"],
+    timeoutSeconds: 120,
+    memory: "512MB",
+  })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+    }
+    if (!isStructuredObject(data) || !Object.keys(data).every((key) => ["scope", "workoutId", "question"].includes(key))) {
+      return { ok: false, error: "Invalid request payload." };
+    }
+    const scope = data.scope === "recent" ? "recent" : "workout";
+    const workoutId = typeof data.workoutId === "string" ? data.workoutId.trim() : "";
+    if (workoutId && !/^[A-Za-z0-9_-]{1,128}$/.test(workoutId)) {
+      return { ok: false, error: "That workout id isn't valid." };
+    }
+    const question = normalizePrompt(data.question || "").slice(0, QUESTION_MAX_LENGTH);
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      console.error("Coach request rejected: missing OPENAI_API_KEY secret", { uid });
+      throw new functions.https.HttpsError("failed-precondition", "OPENAI_API_KEY secret is not configured.");
+    }
+
+    await enforceAiRateLimit(uid, "coach");
+
+    const db = admin.firestore();
+    const snap = await db.collection(`users/${uid}/workouts`)
+      .where("status", "==", WORKOUT_STATUSES.FINAL)
+      .orderBy("updatedAtMs", "desc")
+      .limit(COACH_WORKOUTS_LIMIT)
+      .get();
+    const workouts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const newestFirst = [...workouts].sort((a, b) => (toMs(b.startedAt) ?? 0) - (toMs(a.startedAt) ?? 0));
+
+    let target = null;
+    if (scope === "workout") {
+      if (workoutId) {
+        target = workouts.find((w) => w.id === workoutId) || null;
+        if (!target) {
+          const one = await db.doc(`users/${uid}/workouts/${workoutId}`).get();
+          if (one.exists && one.get("status") === WORKOUT_STATUSES.FINAL) target = { id: one.id, ...one.data() };
+        }
+      } else {
+        target = newestFirst[0] || null;
+      }
+      if (!target) {
+        return { ok: false, error: workoutId ? "That workout wasn't found among your finished workouts." : "There are no finished workouts to analyze yet." };
+      }
+    }
+
+    const hrIds = new Set(newestFirst.slice(0, COACH_HEART_RATE_LIMIT).map((w) => w.id));
+    if (target) hrIds.add(target.id);
+    const hrSnaps = hrIds.size ? await db.getAll(...[...hrIds].map((id) => db.doc(`users/${uid}/workoutHeartRate/${id}`))) : [];
+    const hrById = {};
+    for (const s of hrSnaps) if (s.exists) hrById[s.id] = s.data();
+
+    const facts = scope === "recent"
+      ? buildRecentAnalysisFacts({ workouts, hrById, nowMs: Date.now() })
+      : buildWorkoutAnalysisFacts({ target, history: workouts, hrById });
+    if (scope === "recent" && !facts.workoutCount) {
+      return { ok: false, error: "There are no workouts in the last 4 weeks to analyze." };
+    }
+
+    console.log("Coach analysis requested", { uid, scope, workoutId: target?.id || null, questionLength: question.length });
+
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: COACH_MODEL,
+          temperature: 0.4,
+          max_tokens: 2200,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: COACH_SYSTEM_PROMPT },
+            { role: "user", content: coachUserMessage(facts, question) },
+          ],
+        }),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error("OpenAI API failed (coach)", {
+          uid,
+          status: response.status,
+          statusText: response.statusText,
+          bodyPreview: errorBody.slice(0, 160),
+        });
+        return { ok: false, error: "The coach couldn't be reached. Please try again." };
+      }
+
+      const apiData = await response.json();
+      const report = normalizeCoachReport(apiData?.choices?.[0]?.message?.content || "");
+      if (!report) {
+        console.error("Coach reply was not a usable report", { uid, finishReason: apiData?.choices?.[0]?.finish_reason || null });
+        return { ok: false, error: "The coach's answer came back incomplete. Please try again." };
+      }
+
+      const saved = {
+        scope,
+        workoutId: target ? target.id : null,
+        workoutDate: target ? facts.workout.date : null,
+        routineName: target ? facts.workout.routine : null,
+        period: scope === "recent" ? facts.period : null,
+        question,
+        report,
+        model: COACH_MODEL,
+        createdAtMs: Date.now(),
+      };
+      const ref = db.collection(`users/${uid}/coachReports`).doc();
+      await ref.set(saved);
+      console.warn("Coach analysis succeeded", { svc: "analyzeWorkout", kind: "success", uid, scope, reportId: ref.id });
+      return { ok: true, id: ref.id, ...saved };
+    } catch (error) {
+      if (error instanceof functions.https.HttpsError) throw error;
+      console.error("Coach analysis failed", { uid, scope, message: error?.message || String(error) });
+      return { ok: false, error: "Could not analyze right now. Please try again in a moment." };
     }
   });
 

@@ -9,10 +9,11 @@
  */
 
 // BEGIN STAMP
-const BUILD_ID = "88ac7659cfb4";
+const BUILD_ID = "11f3ade6cc4e";
 const PRECACHE = [
   "/app.js",
   "/apple-touch-icon.png",
+  "/coach.html",
   "/data/exercisedb-index.json",
   "/exercise-links.html",
   "/favicon-32.png",

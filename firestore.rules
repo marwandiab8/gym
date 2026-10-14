@@ -166,6 +166,11 @@ service cloud.firestore {
         allow read: if isOwner(userId);
         allow write: if false;
       }
+      // AI coach analyses (functions: analyzeWorkout). Written only by Functions; the Coach page reads them.
+      match /coachReports/{reportId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
       // private/health: when readings last arrived (the token itself is only ever stored hashed).
       match /private/{docId} {
         allow read: if isOwner(userId);
