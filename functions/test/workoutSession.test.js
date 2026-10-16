@@ -386,8 +386,39 @@ test("routines and exercises can be reordered in the UI, and the order is saved"
   assert.match(appSource, /currentEditTemplateExercises = moveListItem\(currentEditTemplateExercises, idx, -1\)/);
   assert.match(appSource, /workoutState\.exercises = moveListItem\(workoutState\.exercises, exIndex, delta\); renderWorkoutBuilder\(\); scheduleAutosave\(\);/);
   // the saved routine keeps whatever order the exercises are in when it is saved
-  assert.match(appSource, /const templateExercises = workoutState\.exercises\.map\(ex => \(\{ exerciseId: ex\.exerciseId, name: ex\.name \}\)\)/);
+  assert.match(appSource, /const templateExercises = routineExercisesFromWorkout\(workoutState\.exercises\)/);
   // rules accept an integer order on routines
-  assert.match(rules, /hasOnly\(\["name", "exercises", "createdAt", "order"\]\)/);
+  assert.match(rules, /hasOnly\(\["name", "exercises", "createdAt", "order", "coach"\]\)/);
   assert.match(rules, /data\.order is int/);
+});
+
+test("a coach routine starts with one set per target, and the targets are the hints", async () => {
+  const { workoutExercisesFromRoutine, routineExercisesFromWorkout, setPlaceholder, targetsLine } = await loadClientModule("../../public/js/workoutSession.js");
+  const routine = [
+    { exerciseId: "wger_1627", name: "Barbell squat", targets: [{ weight: "45", reps: "15" }, { weight: "225", reps: "6" }, { weight: "", reps: "" }], targetNote: " Rest 3-5 min " },
+    { exerciseId: "wger_283", name: "Hanging Leg Raises", targets: [{ weight: "", reps: "27" }] },
+    { exerciseId: "wger_475", name: "Pull-ups" },
+  ];
+  const [squat, raises, pullups] = workoutExercisesFromRoutine(routine, 1000);
+  assert.equal(squat.sets.length, 3, "one set per planned set, numbers or not");
+  assert.deepEqual(squat.sets[0], { weight: "", reps: "", rpe: "" }, "nothing logged yet: the targets are only hints");
+  assert.deepEqual(squat.targets, [{ weight: "45", reps: "15" }, { weight: "225", reps: "6" }, { weight: "", reps: "" }]);
+  assert.equal(squat.targetNote, "Rest 3-5 min");
+  assert.equal(squat.addedAt, 1000);
+  assert.equal(pullups.sets.length, 1);
+  assert.equal(pullups.targets, undefined, "an ordinary routine stays as it was");
+
+  assert.equal(setPlaceholder(squat, 1, "weight"), "Target: 225");
+  assert.equal(setPlaceholder(squat, 1, "reps"), "Target: 6");
+  assert.equal(setPlaceholder({ ...raises, lastSets: [{ weight: "", reps: "20" }] }, 0, "weight"), "Last: 0", "no target weight: last time's");
+  assert.equal(setPlaceholder({ ...squat, lastSets: [{ weight: "135", reps: "8" }, { weight: "185", reps: "5" }, { weight: "205", reps: "5" }] }, 2, "weight"), "Last: 205", "a set with no target numbers: last time's");
+  assert.equal(setPlaceholder({ ...squat, lastSets: [] }, 5, "reps"), "", "past the plan, nothing before: no hint");
+
+  assert.equal(targetsLine(squat.targets), "45×15 · 225×6 · —");
+  assert.equal(targetsLine([{ weight: "", reps: "" }, { weight: "", reps: "" }, { weight: "", reps: "" }]), "3 sets");
+  assert.equal(targetsLine(raises.targets), "BW×27");
+  assert.deepEqual(routineExercisesFromWorkout([squat, pullups]), [
+    { exerciseId: "wger_1627", name: "Barbell squat", targets: squat.targets, targetNote: "Rest 3-5 min" },
+    { exerciseId: "wger_475", name: "Pull-ups" },
+  ], "saving or updating the routine keeps the targets");
 });

@@ -103,9 +103,12 @@ service cloud.firestore {
       isOptionalString(data.archivedByUid, 120);
     }
 
+    // coach: on a routine made from the AI coach's next-session plan ({ reportId, note }); its exercises then carry
+    // targets (weight and reps per set) and a targetNote.
     function validTemplate(data) {
-      return data.keys().hasOnly(["name", "exercises", "createdAt", "order"]) &&
+      return data.keys().hasOnly(["name", "exercises", "createdAt", "order", "coach"]) &&
         (!data.keys().hasAny(["order"]) || data.order is int) &&
+        (!data.keys().hasAny(["coach"]) || data.coach is map) &&
         isNonEmptyString(data.name, 80) &&
         data.exercises is list &&
         data.exercises.size() <= 25;

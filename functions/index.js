@@ -14,6 +14,13 @@ const {
   normalizeAiExercises,
 } = require("./lib/aiRoutine");
 const {
+  ROUTINE_PLAN_SYSTEM_PROMPT,
+  knownExercisesFromWorkouts,
+  normalizeRoutinePlan,
+  resolvePlanExercises,
+  routinePlanUserMessage,
+} = require("./lib/coachRoutine");
+const {
   buildDateRepairPlan,
   normalizeDateKey,
   prDateRepairPatch,
@@ -68,6 +75,7 @@ const INTEGRITY_SCAN_LIMIT = 80;
 const AI_LIMITS = {
   routine: { suffix: "", max: AI_MAX_REQUESTS_PER_WINDOW, again: "generating another routine", hourly: "Hourly AI generation limit reached. Please try again later." },
   coach: { suffix: "_coach", max: COACH_MAX_REQUESTS_PER_WINDOW, again: "asking the coach again", hourly: `The coach can do ${COACH_MAX_REQUESTS_PER_WINDOW} analyses an hour. Please try again later.` },
+  coachRoutine: { suffix: "_coachRoutine", max: 20, again: "making another routine", hourly: "You can make 20 routines from the coach an hour. Please try again later." },
 };
 
 async function enforceAiRateLimit(uid, kind = "routine") {
@@ -1190,6 +1198,85 @@ exports.analyzeWorkout = functions
       if (error instanceof functions.https.HttpsError) throw error;
       console.error("Coach analysis failed", { uid, scope, message: error?.message || String(error) });
       return { ok: false, error: "Could not analyze right now. Please try again in a moment." };
+    }
+  });
+
+// "Make it a routine": a coach report's next-session plan as a routine - exercises from the athlete's own list, with a
+// target weight and reps for each set (lib/coachRoutine.js). The plan is kept on the report, so asking again is free.
+// Request: { reportId }. Answer: { ok, plan: { name, note, exercises: [{ exerciseId, name, sets: [{ weight, reps }], note }] } }.
+exports.coachNextSessionRoutine = functions
+  .runWith({
+    secrets: ["OPENAI_API_KEY"],
+    timeoutSeconds: 120,
+    memory: "256MB",
+  })
+  .region(AI_REGION)
+  .https.onCall(async (data, context) => {
+    const uid = context.auth?.uid;
+    if (!uid) {
+      throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
+    }
+    const reportId = isStructuredObject(data) && typeof data.reportId === "string" ? data.reportId.trim() : "";
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(reportId)) {
+      return { ok: false, error: "That analysis wasn't found." };
+    }
+    const db = admin.firestore();
+    const ref = db.doc(`users/${uid}/coachReports/${reportId}`);
+    const snap = await ref.get();
+    if (!snap.exists) return { ok: false, error: "That analysis wasn't found." };
+    const saved = snap.get("report.nextSessionPlan");
+    if (saved && Array.isArray(saved.exercises) && saved.exercises.length) return { ok: true, plan: saved };
+    const text = String(snap.get("report.nextSession") || "").trim();
+    if (!text) return { ok: false, error: "This analysis has no plan for the next session." };
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      console.error("Coach routine rejected: missing OPENAI_API_KEY secret", { uid });
+      throw new functions.https.HttpsError("failed-precondition", "OPENAI_API_KEY secret is not configured.");
+    }
+    await enforceAiRateLimit(uid, "coachRoutine");
+
+    const workoutSnap = await db.collection(`users/${uid}/workouts`)
+      .where("status", "==", WORKOUT_STATUSES.FINAL)
+      .orderBy("updatedAtMs", "desc")
+      .limit(COACH_WORKOUTS_LIMIT)
+      .get();
+    const workouts = workoutSnap.docs.map((d) => d.data());
+    const known = knownExercisesFromWorkouts(workouts);
+    const unit = workouts[0]?.unit === "kg" ? "kg" : "lb";
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: COACH_FALLBACK_MODEL,
+          temperature: 0.1,
+          max_tokens: 2000,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: ROUTINE_PLAN_SYSTEM_PROMPT },
+            { role: "user", content: routinePlanUserMessage({ text, unit, exercises: known }) },
+          ],
+        }),
+      });
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error("OpenAI API failed (coach routine)", { uid, status: response.status, bodyPreview: errorBody.slice(0, 160) });
+        return { ok: false, error: "Couldn't make the routine right now. Please try again." };
+      }
+      const apiData = await response.json();
+      const plan = resolvePlanExercises(normalizeRoutinePlan(apiData?.choices?.[0]?.message?.content || ""), known);
+      if (!plan) {
+        console.error("Coach routine reply was not usable", { uid, reportId });
+        return { ok: false, error: "Couldn't turn that plan into a routine. Please try again." };
+      }
+      await ref.update({ "report.nextSessionPlan": { ...plan, unit, model: COACH_FALLBACK_MODEL, madeAtMs: Date.now() } });
+      console.warn("Coach routine made", { svc: "coachNextSessionRoutine", kind: "success", uid, reportId, exercises: plan.exercises.length, unmatched: plan.exercises.filter((e) => !e.exerciseId).length });
+      return { ok: true, plan: { ...plan, unit } };
+    } catch (error) {
+      if (error instanceof functions.https.HttpsError) throw error;
+      console.error("Coach routine failed", { uid, reportId, message: error?.message || String(error) });
+      return { ok: false, error: "Couldn't make the routine right now. Please try again." };
     }
   });
 

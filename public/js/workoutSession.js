@@ -324,3 +324,55 @@ export function moveRoutine(sortedRoutines, id, delta) {
     .map((routine) => ({ id: routine.id, order: routine.order }));
   return { routines, updates };
 }
+
+// ---- Coach routines: a routine made from the AI coach's next-session plan carries, on each exercise, `targets` - the
+// weight and reps for each set - and `targetNote`. Starting it gives one set per target, with the targets as hints.
+
+/** A routine's exercises as a new workout's: one empty set per target (or one when it has none), targets kept. */
+export function workoutExercisesFromRoutine(routineExercises, nowMs = Date.now()) {
+  return (Array.isArray(routineExercises) ? routineExercises : []).map((ex) => {
+    // One target per planned set; a set the coach gave no numbers for is a target with none ("3 leg-curl sets").
+    const targets = (Array.isArray(ex?.targets) ? ex.targets : [])
+      .map((t) => ({ weight: String(t?.weight ?? "").trim(), reps: String(t?.reps ?? "").trim() }));
+    return {
+      exerciseId: ex?.exerciseId,
+      name: ex?.name,
+      exerciseNote: "",
+      sets: (targets.length ? targets : [null]).map(() => ({ weight: "", reps: "", rpe: "" })),
+      lastSets: [],
+      addedAt: nowMs,
+      firstEditTime: null,
+      lastEditTime: null,
+      ...(targets.length ? { targets, targetNote: String(ex.targetNote || "").trim() } : {}),
+    };
+  });
+}
+
+/** A workout's exercises as a routine's: each exercise, with its coach targets when it has them. */
+export function routineExercisesFromWorkout(exercises) {
+  return (Array.isArray(exercises) ? exercises : []).map((ex) => ({
+    exerciseId: ex.exerciseId,
+    name: ex.name,
+    ...(Array.isArray(ex.targets) && ex.targets.length ? { targets: ex.targets, targetNote: ex.targetNote || "" } : {}),
+  }));
+}
+
+/** The hint in a set's box: the coach's target for that set ("Target: 225"), else what was done last time. */
+export function setPlaceholder(exercise, setIndex, field) {
+  const target = Array.isArray(exercise?.targets) ? exercise.targets[setIndex] : null;
+  const value = target && (field === "weight" || field === "reps") ? String(target[field] ?? "").trim() : "";
+  if (value) return `Target: ${value}`;
+  return previousSetPlaceholder(exercise?.lastSets, setIndex, field);
+}
+
+/** An exercise's targets on one line: "45×15 · 135×10 · 225×6", "BW×27" with no weight, "3 sets" with no numbers. */
+export function targetsLine(targets) {
+  const list = Array.isArray(targets) ? targets : [];
+  const parts = list.map((t) => {
+    const w = String(t?.weight ?? "").trim();
+    const r = String(t?.reps ?? "").trim();
+    return r ? `${w || "BW"}×${r}` : w;
+  });
+  if (list.length && parts.every((p) => !p)) return `${list.length} set${list.length === 1 ? "" : "s"}`;
+  return parts.map((p) => p || "—").join(" · ");
+}

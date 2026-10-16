@@ -30,6 +30,10 @@ import {
   selectEmptyStaleDraftIds,
   sortRoutines,
   selectPreviousExerciseSessions,
+  workoutExercisesFromRoutine,
+  routineExercisesFromWorkout,
+  setPlaceholder,
+  targetsLine,
 } from "./js/workoutSession.js";
 
 const firebaseConfig = { 
@@ -1840,8 +1844,8 @@ function updateExerciseSetPlaceholders(card, exercise) {
     const setIndex = Number(row.dataset.idx);
     const weightInput = row.querySelector(".w");
     const repsInput = row.querySelector(".r");
-    if (weightInput) weightInput.placeholder = previousSetPlaceholder(exercise.lastSets, setIndex, "weight");
-    if (repsInput) repsInput.placeholder = previousSetPlaceholder(exercise.lastSets, setIndex, "reps");
+    if (weightInput) weightInput.placeholder = setPlaceholder(exercise, setIndex, "weight");
+    if (repsInput) repsInput.placeholder = setPlaceholder(exercise, setIndex, "reps");
   });
 }
 
@@ -2179,7 +2183,7 @@ function renderTemplatesList() {
     if (!loadedTemplates.length) { els.templatesList.innerHTML = `<div class="text-zinc-500 text-sm">No routines saved yet.</div>`; return; }
     loadedTemplates.forEach((template, position) => {
         const div = document.createElement("div"); div.className = "bg-zinc-800 p-4 rounded-xl border border-zinc-700 flex justify-between items-center hover:border-indigo-500/50 transition-colors group";
-        div.innerHTML = `<div class="flex flex-col gap-1 pr-3"><button type="button" class="moveTemplateUp ${MOVE_BTN_CLASS}" title="Move up" aria-label="Move ${escapeHtml(template.name)} up"${position === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="moveTemplateDown ${MOVE_BTN_CLASS}" title="Move down" aria-label="Move ${escapeHtml(template.name)} down"${position === loadedTemplates.length - 1 ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button></div><div class="flex-1 pr-4 min-w-0"><div class="font-bold text-zinc-100 group-hover:text-indigo-400 transition-colors">${escapeHtml(template.name)}</div><div class="text-xs text-zinc-400 mt-1">${(template.exercises || []).map(e => e.name).join(", ").substring(0, 40)}...</div></div><div class="flex items-center gap-2"><button class="editTemplateBtn text-zinc-400 hover:text-white px-3 py-2 rounded-lg bg-zinc-700/50 hover:bg-zinc-700 transition-colors border border-zinc-700"><i class="fa-solid fa-pen"></i></button><button class="startTemplateBtn bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-indigo-900/20 transition-colors">Start</button></div>`;
+        div.innerHTML = `<div class="flex flex-col gap-1 pr-3"><button type="button" class="moveTemplateUp ${MOVE_BTN_CLASS}" title="Move up" aria-label="Move ${escapeHtml(template.name)} up"${position === 0 ? " disabled" : ""}><i class="fa-solid fa-chevron-up"></i></button><button type="button" class="moveTemplateDown ${MOVE_BTN_CLASS}" title="Move down" aria-label="Move ${escapeHtml(template.name)} down"${position === loadedTemplates.length - 1 ? " disabled" : ""}><i class="fa-solid fa-chevron-down"></i></button></div><div class="flex-1 pr-4 min-w-0"><div class="font-bold text-zinc-100 group-hover:text-indigo-400 transition-colors">${escapeHtml(template.name)}${template.coach ? ` <span class="ml-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 align-middle text-[10px] font-bold uppercase tracking-wide text-emerald-300">Coach</span>` : ""}</div><div class="text-xs text-zinc-400 mt-1">${(template.exercises || []).map(e => e.name).join(", ").substring(0, 40)}...</div></div><div class="flex items-center gap-2"><button class="editTemplateBtn text-zinc-400 hover:text-white px-3 py-2 rounded-lg bg-zinc-700/50 hover:bg-zinc-700 transition-colors border border-zinc-700"><i class="fa-solid fa-pen"></i></button><button class="startTemplateBtn bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-lg shadow-indigo-900/20 transition-colors">Start</button></div>`;
         div.querySelector(".startTemplateBtn").onclick = () => startWorkoutFromTemplate(template.id, template);
         div.querySelector(".editTemplateBtn").onclick = () => openTemplateEditModal(template.id, template);
         div.querySelector(".moveTemplateUp").onclick = () => moveTemplate(template.id, -1);
@@ -2251,12 +2255,12 @@ els.closeTemplateModalBtn?.addEventListener("click", () => els.templateModal.clo
 els.saveTemplateBtn?.addEventListener("click", async () => {
     if (!currentUser || !activeWorkoutRef || workoutState.exercises.length === 0) return setStatus("Add exercises to save a routine.", "error");
     const name = prompt("Name your routine (e.g., 'Leg Day', 'Upper Body'):"); if (!name || !name.trim()) return;
-    try { const templateExercises = workoutState.exercises.map(ex => ({ exerciseId: ex.exerciseId, name: ex.name })); const docRef = await addDoc(collection(db, "users", currentUser.uid, "templates"), { name: name.trim(), exercises: templateExercises, createdAt: serverTimestamp() }); workoutState.templateId = docRef.id; setActiveBadge(); setStatus("Routine saved successfully!", "info"); loadTemplates(); } catch(e) { setStatus("Failed to save routine.", "error"); }
+    try { const templateExercises = routineExercisesFromWorkout(workoutState.exercises); const docRef = await addDoc(collection(db, "users", currentUser.uid, "templates"), { name: name.trim(), exercises: templateExercises, createdAt: serverTimestamp() }); workoutState.templateId = docRef.id; setActiveBadge(); setStatus("Routine saved successfully!", "info"); loadTemplates(); } catch(e) { setStatus("Failed to save routine.", "error"); }
 });
 
 els.updateTemplateBtn?.addEventListener("click", async () => {
     if (!currentUser || !activeWorkoutRef || !workoutState.templateId) return;
-    try { els.updateTemplateBtn.disabled = true; els.updateTemplateBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Updating...`; const templateExercises = workoutState.exercises.map(ex => ({ exerciseId: ex.exerciseId, name: ex.name })); await updateDoc(doc(db, "users", currentUser.uid, "templates", workoutState.templateId), { exercises: templateExercises }); setStatus("Routine updated!", "info"); loadTemplates(); } catch(e) { setStatus("Failed to update routine.", "error"); } finally { els.updateTemplateBtn.disabled = false; els.updateTemplateBtn.innerHTML = `Update Routine`; }
+    try { els.updateTemplateBtn.disabled = true; els.updateTemplateBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Updating...`; const templateExercises = routineExercisesFromWorkout(workoutState.exercises); await updateDoc(doc(db, "users", currentUser.uid, "templates", workoutState.templateId), { exercises: templateExercises }); setStatus("Routine updated!", "info"); loadTemplates(); } catch(e) { setStatus("Failed to update routine.", "error"); } finally { els.updateTemplateBtn.disabled = false; els.updateTemplateBtn.innerHTML = `Update Routine`; }
 });
 
 async function startWorkoutFromTemplate(templateId, template) {
@@ -2269,7 +2273,7 @@ async function startWorkoutFromTemplate(templateId, template) {
         if (els.startWorkoutBtn) els.startWorkoutBtn.disabled = true;
         if (activeWorkoutRef) { await deleteDoc(activeWorkoutRef); clearLocalDraft(); }
         const workoutDate = resolveDateForNewWorkout();
-        const newExercises = template.exercises.map(ex => ({ exerciseId: ex.exerciseId, name: ex.name, exerciseNote: "", sets: [{weight: "", reps: "", rpe: ""}], lastSets: [], addedAt: Date.now(), firstEditTime: null, lastEditTime: null }));
+        const newExercises = workoutExercisesFromRoutine(template.exercises);
         activeWorkoutRef = await createWorkoutDraftInFirestore({
           exercises: newExercises,
           templateId,
@@ -2290,7 +2294,7 @@ async function startWorkoutFromTemplate(templateId, template) {
         renderWorkoutBuilder();
         await saveWorkoutDraft();
         await updateResumeDraftButtonState();
-        setStatus("Routine started ✓");
+        setStatus(template.coach?.note ? `Coach's plan started ✓ ${template.coach.note}` : "Routine started ✓");
         if (currentRoute === "routines") {
           history.pushState(null, "", "index.html");
           handleRouteChange();
@@ -2353,8 +2357,8 @@ function renderWorkoutBuilder() {
     card.dataset.exerciseId = ex.exerciseId;
     function trackTime() { if (!ex.firstEditTime) ex.firstEditTime = Date.now(); ex.lastEditTime = Date.now(); }
     const setsHtml = ex.sets.map((s, idx) => {
-      const phW = previousSetPlaceholder(ex.lastSets, idx, "weight");
-      const phR = previousSetPlaceholder(ex.lastSets, idx, "reps");
+      const phW = setPlaceholder(ex, idx, "weight");
+      const phR = setPlaceholder(ex, idx, "reps");
       return `
         <div class="flex flex-wrap items-end gap-3 bg-zinc-800 p-4 rounded-xl border border-zinc-700 mb-3" data-idx="${idx}">
           <div class="flex-1"><label class="block text-xs text-zinc-400 mb-1">Set ${idx + 1} - Weight</label><input class="w w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500" type="number" step="0.5" value="${escapeHtml(s.weight)}" placeholder="${escapeHtml(phW)}"></div>
@@ -2373,7 +2377,7 @@ function renderWorkoutBuilder() {
     </div>
     <label class="block text-xs text-zinc-500 mb-1">Notes</label>
     <textarea class="exercise-note-input w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-emerald-500 resize-y min-h-[60px] mb-4" rows="2" placeholder="Add note for this exercise">${escapeHtml(ex.exerciseNote)}</textarea>
-    <div class="flex flex-wrap gap-2 mb-4"><button class="addSet bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">+ Add Set</button><button class="copyLast bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">Copy Last</button><button class="removeExercise text-red-400 hover:text-red-300 px-4 py-2 text-sm ml-auto">Remove</button></div>${exerciseProgressHtml(ex)}<div>${setsHtml}</div>`;
+    ${ex.targets?.length ? `<div class="mb-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-sm"><span class="font-semibold text-emerald-300"><i class="fa-solid fa-bullseye mr-1"></i>Coach target:</span> <span class="text-zinc-200">${escapeHtml(targetsLine(ex.targets))}</span>${ex.targetNote ? `<div class="mt-0.5 text-xs text-zinc-400">${escapeHtml(ex.targetNote)}</div>` : ""}</div>` : ""}<div class="flex flex-wrap gap-2 mb-4"><button class="addSet bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">+ Add Set</button><button class="copyLast bg-zinc-800 hover:bg-zinc-700 text-zinc-100 px-4 py-2 rounded-lg text-sm border border-zinc-600">Copy Last</button>${ex.targets?.length ? `<button class="fillTargets bg-emerald-900/40 hover:bg-emerald-900/70 text-emerald-200 px-4 py-2 rounded-lg text-sm border border-emerald-700/60">Fill targets</button>` : ""}<button class="removeExercise text-red-400 hover:text-red-300 px-4 py-2 text-sm ml-auto">Remove</button></div>${exerciseProgressHtml(ex)}<div>${setsHtml}</div>`;
     const moveExercise = (delta) => { workoutState.exercises = moveListItem(workoutState.exercises, exIndex, delta); renderWorkoutBuilder(); scheduleAutosave(); };
     card.querySelector(".ex-move-up").addEventListener("click", () => moveExercise(-1));
     card.querySelector(".ex-move-down").addEventListener("click", () => moveExercise(1));
@@ -2389,6 +2393,14 @@ function renderWorkoutBuilder() {
     });
     card.querySelector(".addSet").addEventListener("click", () => { ex.sets.push({ weight: "", reps: "", rpe: "" }); trackTime(); renderWorkoutBuilder(); scheduleAutosave(); });
     card.querySelector(".copyLast").addEventListener("click", () => { if (!ex.lastSets?.length) return setStatus("No previous sets found"); ex.sets = ex.lastSets.map(s => ({ weight: s.weight, reps: s.reps, rpe: "" })); trackTime(); renderWorkoutBuilder(); scheduleAutosave(); });
+    card.querySelector(".fillTargets")?.addEventListener("click", () => {
+      // The coach's weight and reps in every set it planned (sets already logged keep what you typed).
+      ex.targets.forEach((t, i) => {
+        const set = ex.sets[i] || (ex.sets[i] = { weight: "", reps: "", rpe: "" });
+        if (!String(set.weight ?? "").trim() && !String(set.reps ?? "").trim()) Object.assign(set, { weight: t.weight, reps: t.reps });
+      });
+      trackTime(); renderWorkoutBuilder(); scheduleAutosave();
+    });
     card.querySelector(".removeExercise").addEventListener("click", () => { workoutState.exercises.splice(exIndex, 1); renderWorkoutBuilder(); scheduleAutosave(); });
     card.querySelectorAll("[data-idx]").forEach(row => {
       const idx = Number(row.dataset.idx);
@@ -4378,9 +4390,84 @@ function renderCoachReport(r) {
     ${coachSection("fa-stopwatch", "text-sky-400", "Rest &amp; pacing", rep.pacing ? coachParagraph(rep.pacing) : "")}
     ${coachSection("fa-bed", "text-indigo-400", "Recovery between workouts", rep.recovery ? coachParagraph(rep.recovery) : "")}
     ${coachSection("fa-list-check", "text-emerald-400", "Recommendations", recommendations)}
-    ${rep.nextSession ? `<section class="mt-5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3"><h3 class="mb-1 flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-emerald-300"><i class="fa-solid fa-bullseye"></i> Next session</h3>${coachParagraph(rep.nextSession)}</section>` : ""}
+    ${rep.nextSession ? `<section class="mt-5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3"><h3 class="mb-1 flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-emerald-300"><i class="fa-solid fa-bullseye"></i> Next session</h3>${coachParagraph(rep.nextSession)}${coachRoutineHtml(r)}</section>` : ""}
     <div class="mt-5 text-xs text-zinc-600">${escapeHtml(when)}${r.model ? ` · ${escapeHtml(r.model)}` : ""}</div>
   </article>`;
+}
+
+// "Make it a routine": the next-session plan as a routine you can start next time (coachNextSessionRoutine turns the
+// paragraph into exercises with a target per set; it's saved in your routines with those targets).
+function coachRoutineHtml(r) {
+  const rt = coachState?.routine?.reportId === r.id ? coachState.routine : null;
+  const btn = (attrs, label, primary = true) => `<button type="button" ${attrs} class="rounded-lg ${primary ? "bg-emerald-600 text-white hover:bg-emerald-500" : "border border-zinc-700 text-zinc-300 hover:bg-zinc-800"} px-4 py-2 text-sm font-bold disabled:opacity-60" ${rt?.saving ? "disabled" : ""}>${label}</button>`;
+  const error = rt?.error ? `<div class="mt-3 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200" role="alert">${escapeHtml(rt.error)}</div>` : "";
+  if (!rt) return `<div class="mt-3">${btn(`data-coach-routine="${escapeHtml(r.id)}"`, `<i class="fa-solid fa-list-check mr-2"></i>Make it a routine`)}</div>`;
+  if (rt.loading) return `<p class="mt-3 text-sm text-zinc-400"><i class="fa-solid fa-spinner fa-spin mr-2"></i>Turning the plan into a routine…</p>`;
+  if (rt.savedName) return `<div class="mt-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200"><i class="fa-solid fa-circle-check mr-2"></i>Saved as “${escapeHtml(rt.savedName)}”. Start it from <a href="index.html#routines" class="font-semibold underline">Routines</a> next time: each set shows the coach's target.</div>`;
+  if (!rt.plan) return `${error}<div class="mt-3">${btn(`data-coach-routine="${escapeHtml(r.id)}"`, "Try again")}</div>`;
+  const rows = rt.plan.exercises.map((e) => `<li class="flex justify-between gap-3 py-2 text-sm"><span class="min-w-0 text-zinc-100">${escapeHtml(e.name)}${e.exerciseId ? "" : ` <span class="text-xs text-amber-300">(new to you: added as your own exercise)</span>`}${e.note ? `<span class="block text-xs text-zinc-500">${escapeHtml(e.note)}</span>` : ""}</span><span class="shrink-0 text-right text-zinc-300">${escapeHtml(targetsLine(e.sets))}</span></li>`).join("");
+  return `<div class="mt-3 rounded-xl border border-zinc-700 bg-zinc-950/70 p-3">
+    <label class="block"><span class="mb-1 block text-xs font-bold uppercase text-zinc-500">Routine name</span><input id="coachRoutineName" maxlength="80" value="${escapeHtml(rt.name)}" class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-white focus:border-emerald-500 focus:outline-none"></label>
+    <ul class="mt-2 divide-y divide-zinc-800">${rows}</ul>
+    ${rt.plan.note ? `<p class="mt-2 text-xs text-zinc-400">${escapeHtml(rt.plan.note)}</p>` : ""}
+    ${error}
+    <div class="mt-3 flex flex-wrap gap-2">${btn("data-coach-routine-save", rt.saving ? `<i class="fa-solid fa-spinner fa-spin mr-2"></i>Saving…` : `<i class="fa-solid fa-floppy-disk mr-2"></i>Save to my routines`)}${btn("data-coach-routine-cancel", "Cancel", false)}</div>
+  </div>`;
+}
+
+async function makeCoachRoutine(reportId) {
+  const st = coachState;
+  if (!st || !currentUser) return;
+  const report = st.reports.find((x) => x.id === reportId);
+  st.routine = { reportId, loading: true };
+  renderCoachPage();
+  try {
+    let plan = report?.report?.nextSessionPlan?.exercises?.length ? report.report.nextSessionPlan : null;
+    if (!plan) {
+      const { data } = await httpsCallable(functions, "coachNextSessionRoutine", { timeout: 130000 })({ reportId });
+      if (!data?.ok) throw Object.assign(new Error(data?.error || "Couldn't make the routine. Please try again."), { shown: true });
+      plan = data.plan;
+      if (report) report.report = { ...(report.report || {}), nextSessionPlan: plan };
+    }
+    st.routine = { reportId, plan, name: plan.name || "Coach plan" };
+  } catch (e) {
+    console.error("Coach routine failed", e);
+    const fromServer = e?.shown || (e?.code && e.code !== "functions/internal" && e.code !== "functions/unavailable");
+    st.routine = { reportId, error: fromServer ? e.message : "Couldn't reach the coach. Check your connection and try again." };
+  }
+  renderCoachPage();
+}
+
+async function saveCoachRoutine() {
+  const rt = coachState?.routine;
+  if (!rt?.plan || rt.saving || !currentUser) return;
+  const name = String(rt.name || "").trim().slice(0, 80) || rt.plan.name || "Coach plan";
+  rt.saving = true;
+  rt.error = "";
+  renderCoachPage();
+  try {
+    const exercises = [];
+    for (const ex of rt.plan.exercises) {
+      let id = ex.exerciseId;
+      let exName = ex.name;
+      if (!id) {
+        // Not one you've logged: it becomes your own exercise (or the one you already made with that name).
+        const made = await saveCustomExerciseByName(ex.name, { addToActiveWorkout: false });
+        if (!made) continue;
+        id = made.id;
+        exName = made.name || ex.name;
+      }
+      exercises.push({ exerciseId: id, name: exName, targets: ex.sets.map((t) => ({ weight: t.weight || "", reps: t.reps || "" })), ...(ex.note ? { targetNote: ex.note } : {}) });
+    }
+    if (!exercises.length) throw new Error("no exercises");
+    await addDoc(collection(db, "users", currentUser.uid, "templates"), { name, exercises, createdAt: serverTimestamp(), coach: { reportId: rt.reportId, note: rt.plan.note || "" } });
+    Object.assign(rt, { saving: false, savedName: name });
+    loadTemplates();
+  } catch (e) {
+    console.error("Saving the coach routine failed", e);
+    Object.assign(rt, { saving: false, error: "Couldn't save the routine. Check your connection and try again." });
+  }
+  renderCoachPage();
 }
 
 function renderCoachPage() {
@@ -4453,6 +4540,20 @@ document.getElementById("coachPage")?.addEventListener("click", (event) => {
     runCoachAnalysis();
     return;
   }
+  const routineBtn = event.target.closest("[data-coach-routine]");
+  if (routineBtn) {
+    makeCoachRoutine(routineBtn.dataset.coachRoutine);
+    return;
+  }
+  if (event.target.closest("[data-coach-routine-save]")) {
+    saveCoachRoutine();
+    return;
+  }
+  if (event.target.closest("[data-coach-routine-cancel]")) {
+    coachState.routine = null;
+    renderCoachPage();
+    return;
+  }
   const reportBtn = event.target.closest("[data-coach-report]");
   if (reportBtn) {
     coachState.shownId = reportBtn.dataset.coachReport;
@@ -4465,6 +4566,7 @@ document.getElementById("coachPage")?.addEventListener("change", (event) => {
 });
 document.getElementById("coachPage")?.addEventListener("input", (event) => {
   if (coachState && event.target.id === "coachQuestion") coachState.question = event.target.value;
+  if (coachState?.routine && event.target.id === "coachRoutineName") coachState.routine.name = event.target.value;
 });
 
 // ==================== EXERCISE CARD & MACHINE PHOTOS ====================
